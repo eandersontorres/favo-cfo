@@ -31,18 +31,33 @@
 // Condition 2 exists because condition 1 is a build-time promise and build
 // pipelines get edited. Belt and braces on an auth path is worth the ten lines.
 //
-// ── WHY THE TOKEN IS EXCHANGED, NOT JUST READ ──────────────────────────────
+// ── TWO TOKENS, ON PURPOSE ─────────────────────────────────────────────────
 //
-// Keycloak returns its OWN token. The apps' data layer is Supabase RLS, which
-// validates Supabase-issued JWTs — a Keycloak token is not interchangeable.
-// So on return we keep the Supabase session that the federated login already
-// established (Keycloak brokers TO Supabase, so signing in through Keycloak
-// leaves a valid Supabase session behind) and store the Keycloak token
-// alongside it for anything that wants the richer claims (roles, tenant_id).
+// Keycloak returns its OWN token, but the apps authorise against Supabase RLS,
+// which only accepts Supabase-issued JWTs. A Keycloak token cannot read
+// clv_tenant_members, so on its own it authenticates the user and then fails
+// the access check.
 //
-// That is a deliberate stopgap for the dev environment. The end state is the
-// engine validating Keycloak tokens directly, at which point the exchange
-// disappears rather than growing.
+// So after a Keycloak login the app needs BOTH: Keycloak's token for claims
+// and roles, and a Supabase session for every RLS query.
+//
+// Two ways to get the Supabase session, tried in order:
+//
+//   1. The consent page stashes the one it already had (HANDOFF_KEY). Free,
+//      but only available when consent actually ran — and once Keycloak has a
+//      session of its own, the whole Supabase leg is skipped, so this misses.
+//
+//   2. Exchange the Keycloak token for a Supabase session at
+//      /auth/v1/token?grant_type=id_token. Supabase accepts an OIDC id_token
+//      from a configured provider and issues its own session for the matching
+//      user. This is the reliable path and the reason the flow works on a
+//      returning login.
+//
+//   session the app uses for data  -> Supabase (RLS works unchanged)
+//   token kept for claims/roles    -> Keycloak (getKeycloakToken/Roles)
+//
+// This is the interim step. When the engine validates Keycloak tokens
+// directly, both paths and the Supabase session delete together.
 
 const KC_URL = import.meta.env.VITE_KEYCLOAK_URL || "";
 const KC_REALM = import.meta.env.VITE_KEYCLOAK_REALM || "favo";
@@ -50,6 +65,20 @@ const KC_CLIENT = import.meta.env.VITE_KEYCLOAK_CLIENT_ID || "";
 
 const VERIFIER_KEY = "favo_kc_verifier";
 const TOKEN_KEY = "favo_kc_token";
+
+/**
+ * Where the consent page leaves the Supabase session for the app to pick up.
+ *
+ * The apps authorise against Supabase RLS, which only accepts Supabase-issued
+ * JWTs — a Keycloak token cannot read clv_tenant_members, so a Keycloak login
+ * would authenticate the user and then fail the access check. The consent page
+ * already holds a valid Supabase session (it needed one to call the consent
+ * API), so it stashes it here instead of discarding it on redirect.
+ *
+ * sessionStorage, and consumed exactly once: the value is a live token, and it
+ * should not outlive the tab or survive a second read.
+ */
+export const HANDOFF_KEY = "favo_kc_supabase_handoff";
 
 /** Hosts where the Keycloak path may run. Production is deliberately absent. */
 function devHost() {
@@ -180,27 +209,87 @@ export async function consumeKeycloakCode(target) {
       expires_at: Math.floor(Date.now() / 1000) + (tokens.expires_in || 900),
       claims,
     }));
-    // Apps that gate on a Supabase-shaped session in storage get one written
-    // too, so this path does not require touching their auth guard. The token
-    // inside is Keycloak's; see the note at the top about why that is a
-    // stopgap and not the destination.
+    // Adopt the Supabase session the consent page left behind, so the app's
+    // existing auth guard and every RLS query keep working untouched. Consumed
+    // once: a live token should not linger in storage waiting to be reused.
     if (target) {
-      const session = {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token || null,
-        expires_at: Math.floor(Date.now() / 1000) + (tokens.expires_in || 900),
-        expires_in: tokens.expires_in || 900,
-        token_type: "bearer",
-        user: claims ? { id: claims.sub, email: claims.email } : null,
-      };
-      if (typeof target === "function") target(session, claims);
-      else localStorage.setItem(target, JSON.stringify(session));
+      let handoff = null;
+      try {
+        const raw = sessionStorage.getItem(HANDOFF_KEY);
+        if (raw) {
+          handoff = JSON.parse(raw);
+          sessionStorage.removeItem(HANDOFF_KEY);
+        }
+      } catch { /* ignore */ }
+
+      if (handoff?.access_token) {
+        if (typeof target === "function") {
+          // Apps with a custom writer expect (session, payload); give them the
+          // Supabase session and the Keycloak claims as the payload, so the
+          // shape matches what consumeFavoHandoff passes them.
+          target(handoff, { user: handoff.user || null, claims });
+        } else {
+          localStorage.setItem(target, JSON.stringify(handoff));
+        }
+      }
+      // No stash: exchange the Keycloak id_token for a real Supabase session.
+      // Without this, a returning user (Keycloak session still valid, consent
+      // page skipped) would be authenticated but unable to read anything.
+      if (!handoff?.access_token && tokens.id_token) {
+        const exchanged = await exchangeForSupabase(tokens.id_token);
+        if (exchanged?.access_token) {
+          if (typeof target === "function") {
+            target(exchanged, { user: exchanged.user || null, claims });
+          } else {
+            localStorage.setItem(target, JSON.stringify(exchanged));
+          }
+        }
+        // Still nothing? Write NOTHING rather than a Keycloak token in a
+        // Supabase slot — that would make the app believe it is signed in and
+        // then fail every query. Falling through to its own login is better.
+      }
     }
   } catch {
     return null;
   }
 
   return claims;
+}
+
+/**
+ * Trade a Keycloak id_token for a Supabase session.
+ *
+ * Supabase's grant_type=id_token accepts an OIDC token from a provider it is
+ * configured to trust and returns its own session for the matching user. The
+ * user must already exist in Supabase — which it does, because Keycloak
+ * federated TO Supabase to authenticate in the first place.
+ *
+ * Returns null on any failure: the caller then leaves storage untouched.
+ */
+async function exchangeForSupabase(idToken) {
+  const supaUrl = import.meta.env.VITE_SUPABASE_URL || "";
+  const anon = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+  if (!supaUrl || !anon) return null;
+  try {
+    const res = await fetch(`${supaUrl.replace(/\/$/, "")}/auth/v1/token?grant_type=id_token`, {
+      method: "POST",
+      headers: { apikey: anon, "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "keycloak", id_token: idToken }),
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!d?.access_token) return null;
+    return {
+      access_token: d.access_token,
+      refresh_token: d.refresh_token || null,
+      expires_at: d.expires_at || Math.floor(Date.now() / 1000) + (d.expires_in || 3600),
+      expires_in: d.expires_in || 3600,
+      token_type: "bearer",
+      user: d.user || null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function decodeClaims(jwt) {
