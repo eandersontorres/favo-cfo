@@ -234,6 +234,10 @@ export default async function handler(req, res) {
     for (const a of accounts || []) nameToId[String(a.name).toLowerCase()] = a.id;
 
     let totalAdded = 0, totalModified = 0, totalRemoved = 0, totalPendingCleared = 0;
+    // Distinct cardholders seen in account_owner this run. Reported so the
+    // operator learns whether the bank populates it at all -- an empty set is
+    // itself the answer, and a silent one would send us hunting again.
+    const cardholders = new Set();
     const institutions = [];
 
     for (const item of items) {
@@ -309,23 +313,47 @@ export default async function handler(req, res) {
           reconciled: false,
           source: classifySource(t, description),
           notes: t.pending ? "Pending — will reconcile when posted" : "",
-          tags: [],
+          // account_owner is Plaid's field for "which sub-account holder made
+          // this", and a corporate card program with one card per employee is
+          // exactly a sub-account arrangement. Bank of America stopped
+          // reporting the per-cardholder accounts on 2026-08-17 and now posts
+          // every charge to the consolidated CORP account, which cost us the
+          // answer to "who spent this". If BoA populates this field, the answer
+          // is right here and we were throwing it away.
+          //
+          // Empty for most institutions -- hence the conditional tag rather
+          // than a column.
+          tags: t.account_owner ? ["cardholder:" + String(t.account_owner).trim().slice(0, 60)] : [],
         };
       };
 
+      for (const t of [...added, ...modified]) if (t.account_owner) cardholders.add(String(t.account_owner).trim());
       const rows = [...added, ...modified].map(toRow);
       if (rows.length > 0) {
         // Never overwrite a category the user (or a prior sync) already set:
         // fetch existing category_ids and preserve any non-null value.
         const existingCat = {};
+        const existingTags = {};
         for (const idsCh of chunk(rows.map(r => r.id), 200)) {
           const { data: ex } = await supabase
             .from("r7_ledger_transactions")
-            .select("id, category_id")
+            .select("id, category_id, tags")
             .in("id", idsCh);
-          for (const e of ex || []) if (e.category_id) existingCat[e.id] = e.category_id;
+          for (const e of ex || []) {
+            if (e.category_id) existingCat[e.id] = e.category_id;
+            if (Array.isArray(e.tags) && e.tags.length) existingTags[e.id] = e.tags;
+          }
         }
         for (const r of rows) if (existingCat[r.id]) r.category_id = existingCat[r.id];
+        // Tags were being reset to [] on every upsert. A pending charge is
+        // re-sent as `modified` when it posts, so any tag the operator had put
+        // on it -- non_recurring is the one the P&L reads for Adjusted EBITDA --
+        // silently vanished a day or two later. Merge instead, and let the
+        // freshly derived cardholder tag replace only its own kind.
+        for (const r of rows) {
+          const prior = (existingTags[r.id] || []).filter(x => !String(x).startsWith("cardholder:"));
+          if (prior.length) r.tags = [...new Set([...prior, ...r.tags])];
+        }
 
         for (const rowsCh of chunk(rows, 200)) {
           const { error: upErr } = await supabase
@@ -465,6 +493,7 @@ export default async function handler(req, res) {
       modified: totalModified,
       removed: totalRemoved,
       pending_cleared: totalPendingCleared,
+      cardholders: [...cardholders],
       institutions,
     });
   } catch (err) {

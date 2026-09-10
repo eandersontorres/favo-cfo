@@ -1408,7 +1408,11 @@ function BankSyncButton({ tenantId, onSync, showToast }) {
         showToast(
           `Bank sync · ${result.added} new · ${result.modified} updated`
           + (result.removed ? ` · ${result.removed} removed` : "")
-          + (result.pending_cleared ? ` · ${result.pending_cleared} pending duplicate${result.pending_cleared === 1 ? "" : "s"} cleared` : ""),
+          + (result.pending_cleared ? ` · ${result.pending_cleared} pending duplicate${result.pending_cleared === 1 ? "" : "s"} cleared` : "")
+          // Whether the bank names the cardholder is the open question behind
+          // the CORP consolidation; say it out loud instead of making someone
+          // query for it.
+          + (result.cardholders?.length ? ` · cardholders: ${result.cardholders.join(", ")}` : ""),
           "success"
         );
       }
