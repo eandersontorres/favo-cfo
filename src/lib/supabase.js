@@ -28,6 +28,16 @@ export async function getMyTenantIds() {
   return data || []
 }
 
+// Tenants em que o usuario e owner/admin (ceo_admins), geridos na aba Team do
+// favo-ceo. E ESTE o portao do CFO -- nao getMyTenantIds(), que responde a
+// pergunta operacional do POS e inclui garcom, cozinha e producao. Mesma
+// convencao de null acima: null = a chamada falhou, [] = nao administra nada.
+export async function getMyCfoTenantIds() {
+  const { data, error } = await supabase.rpc('r7_get_my_cfo_tenant_ids')
+  if (error) { console.error('getMyCfoTenantIds', error); return null }
+  return data || []
+}
+
 export async function signInWithPassword(email, password) {
   return await supabase.auth.signInWithPassword({ email, password })
 }

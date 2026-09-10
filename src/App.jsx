@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "rea
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
 import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, splitTransaction, unsplitTransaction, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
-import { getMyTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
+import { getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
 import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
 
 // Active tenant: localStorage override (set by the sidebar TenantSwitcher) wins
@@ -9493,7 +9493,7 @@ function CEO({ tenantId, tenantName, showToast }) {
 
 // ─── TENANT SWITCHER — sidebar store selector for multi-store managers ────────
 // Replaces the static entity pill. Lists the tenants the logged-in user belongs
-// to (r7_user_tenants via RPC); picking one stores the override and reloads so
+// administra (ceo_admins via RPC); picking one stores the override and reloads so
 // the whole app re-inits against the new tenant. Single-tenant users see the
 // plain pill, same as before.
 function TenantSwitcher() {
@@ -9502,7 +9502,7 @@ function TenantSwitcher() {
     if (ENV_TENANT_ID === "demo" && !localStorage.getItem("cfo_active_tenant")) return;
     (async () => {
       try {
-        const ids = await getMyTenantIds();
+        const ids = await getMyCfoTenantIds();
         if (!ids || ids.length === 0) return;
         // Stale override (membership revoked): fall back to the env tenant.
         if (!ids.includes(TENANT_ID)) {
@@ -9592,9 +9592,14 @@ export default function App() {
     // auth.uid() is null and the query returns nothing). Revoking on that
     // unmounted the whole app for a frame and made the screen blink. Only an
     // actual logout — the !session branch above — closes the gate.
-    getMyTenantIds().then(ids => {
+    // O portao e ceo_admins (owner/admin), NAO o vinculo operacional do POS.
+    // r7_user_tenants carrega garcom, cozinha e producao -- gente que precisa
+    // do POS e nao tem nada que ver folha, gorjeta por funcionario ou banco.
+    // O `|| ids.length > 0` que existia aqui era pior ainda: liberava este
+    // tenant pra qualquer usuario de QUALQUER tenant.
+    getMyCfoTenantIds().then(ids => {
       if (cancelled || ids === null) return;
-      setAuthorized(ids.includes(TENANT_ID) || ids.length > 0);
+      setAuthorized(ids.includes(TENANT_ID));
     });
     return () => { cancelled = true; };
   }, [session]);
