@@ -161,6 +161,16 @@ const TRANSFER_RES = [
 // when the bank's wording drifts.
 const TRANSFER_PFC = new Set(["TRANSFER_IN_ACCOUNT_TRANSFER", "TRANSFER_OUT_ACCOUNT_TRANSFER"]);
 
+// Transfer-type accounts that hold the rows which must never reach the P&L.
+// Names, not ids: the ledger accounts are per-tenant, and nameToId already
+// resolves them. A tenant missing the account simply falls through to the
+// normal categorizer -- the source-based exclusion still protects the P&L.
+const SETTLEMENT_CATEGORY_BY_SOURCE = {
+  square_settlement: "Square Settlement",
+  aggregator_settlement: "Marketplace Settlement",
+  internal_transfer: "Internal Transfer",
+};
+
 function classifySource(t, description) {
   if (SQUARE_RE.test(description)) return "square_settlement";
   // Aggregator INFLOWS are settlements of revenue already booked from the
@@ -297,13 +307,28 @@ export default async function handler(req, res) {
             ? "PENDING"
             : (merchantOf(t) || "TRANSACTION")
         ).toUpperCase().trim().slice(0, 80);
+        // Settlement and transfer rows are NOT bookkeeping work: a Square
+        // deposit is revenue already recognised when the sale synced, and a
+        // move between the tenant's own accounts is not income or expense at
+        // all. Leaving them uncategorized put them in the operator's review
+        // queue anyway -- 31 of 44 rows in a recent week were exactly this --
+        // so the real work drowned in noise and someone eventually filed a
+        // deposit under "Revenue", which reads as double-counted revenue to
+        // anyone opening the ledger.
+        //
+        // Giving them a transfer-type category takes them out of the queue AND
+        // out of the P&L a second way: the roll-ups already drop them by
+        // source, and type='transfer' drops them again by category.
+        const src = classifySource(t, description);
+        const settlementCat = SETTLEMENT_CATEGORY_BY_SOURCE[src];
         return {
           id: "plaid_" + t.transaction_id,
           tenant_id,
           date: t.date || t.authorized_date,
           description,
           amount: -Number(t.amount),                 // flip Plaid's sign -> app convention
-          category_id: suggestCategoryId(t, nameToId), // auto-categorize from Plaid PFC / merchant
+          category_id: (settlementCat && nameToId[settlementCat.toLowerCase()])
+            || suggestCategoryId(t, nameToId),       // auto-categorize from Plaid PFC / merchant
           account: acctName[t.account_id] || item.institution_name || "Plaid",
           // Same id the account materialize step below writes into
           // r7_ledger_bank_accounts. Without it the client's internal-transfer
@@ -311,7 +336,7 @@ export default async function handler(req, res) {
           // as income or expense.
           account_id: t.account_id ? "plaid_acct_" + t.account_id : null,
           reconciled: false,
-          source: classifySource(t, description),
+          source: src,
           notes: t.pending ? "Pending — will reconcile when posted" : "",
           // account_owner is Plaid's field for "which sub-account holder made
           // this", and a corporate card program with one card per employee is
