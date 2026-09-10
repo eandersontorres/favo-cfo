@@ -121,7 +121,7 @@ const STYLES = `
   .logo-mark .logo-dot { color: var(--accent); }
   .logo-sub { font-family: var(--font-mono); font-size: 10px; font-weight: 500; color: var(--accent); letter-spacing: 0.14em; text-transform: uppercase; margin-top: 4px; line-height: 1; }
   .sidebar-section { padding: 16px 10px 8px; }
-  .sidebar-section-label { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); opacity: 0.6; padding: 0 8px 8px; font-family: var(--font-mono); }
+  .sidebar-section-label { font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text3); padding: 0 8px 8px; font-family: var(--font-mono); }
   .nav-item {
     display: flex; align-items: center; gap: 10px;
     padding: 9px 10px; border-radius: var(--radius2);
@@ -132,8 +132,7 @@ const STYLES = `
   .nav-item:hover { background: var(--surface2); color: var(--text); }
   .nav-item.active { background: var(--accentBg); color: var(--accent); border-left: 2px solid var(--accent); }
   .nav-item.active .nav-icon { color: var(--accent); }
-  .nav-icon { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.7; }
-  .nav-item.active .nav-icon { opacity: 1; }
+  .nav-icon { width: 16px; height: 16px; flex-shrink: 0; }
   .nav-badge { margin-left: auto; background: var(--red); color: #fff; font-size: 10px; border-radius: 99px; padding: 1px 6px; font-family: var(--font-mono); }
   .sidebar-footer { margin-top: auto; padding: 14px 12px; border-top: 1px solid var(--border); }
   .entity-pill { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius2); padding: 8px 10px; font-size: 11px; color: var(--text2); }
