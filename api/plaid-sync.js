@@ -98,6 +98,20 @@ const MERCHANT_RULES = [
   ["PUBLIC STORAGE", "Rent & Utilities"],
 ];
 
+// Network descriptors that name the payment RAIL, not the merchant. A pending
+// row carrying only one of these tells the operator nothing, so it is shown as
+// PENDING until the posted version arrives with the real name. Anything not on
+// this list is assumed to be a merchant and kept.
+const GENERIC_DESCRIPTORS = [
+  /^MAIL\/?\s*(TELEPHONE|PHONE)\s*ORDER$/,
+  /^(RECURRING\s+)?(PAYMENT|PURCHASE|TRANSACTION|CHARGE)$/,
+  /^POS\s*(PURCHASE|DEBIT)?$/,
+  /^(CHECKCARD|CHECK\s*CARD|DEBIT\s*CARD|CREDIT\s*CARD)(\s+PURCHASE)?$/,
+  /^PENDING$/,
+  /^INTERNET\s+(PAYMENT|PURCHASE)$/,
+  /^E-?COMMERCE(\s+PURCHASE)?$/,
+];
+
 // Best merchant label for a transaction. merchant_name is the cleanest but is
 // often null on PENDING card transactions (Plaid returns a generic network
 // descriptor like "MAIL/TELEPHONE ORDER" in `name`). counterparties frequently
@@ -261,12 +275,21 @@ export default async function handler(req, res) {
       }
 
       const toRow = (t) => {
-        // Pending card charges often carry only a generic network descriptor
-        // ("MAIL/TELEPHONE ORDER") with no merchant anywhere. Label those
-        // PENDING — the real merchant name arrives when the charge posts and
-        // the posted version replaces this row on the next sync.
+        // Pending card charges sometimes carry only a generic network
+        // descriptor with no merchant anywhere, and labelling those with the
+        // descriptor is worse than saying nothing. But `t.name` is NOT always
+        // generic -- Bank of America passes the real merchant through it
+        // ("SAMS CLUB.COM", "APPLE.COM/BILL"), and discarding it wholesale left
+        // the operator staring at a screen of rows all called PENDING with no
+        // way to tell a $2.99 Apple charge from a $429.96 Sam's Club run.
+        //
+        // So only the descriptors that carry no information are replaced.
+        const raw = String(t.name || "").toUpperCase().trim();
+        const generic = !raw || GENERIC_DESCRIPTORS.some((re) => re.test(raw));
+        const noMerchant = !t.merchant_name
+          && !(Array.isArray(t.counterparties) && t.counterparties.some((c) => c && c.name));
         const description = (
-          t.pending && !t.merchant_name && !(Array.isArray(t.counterparties) && t.counterparties.some((c) => c && c.name))
+          t.pending && noMerchant && generic
             ? "PENDING"
             : (merchantOf(t) || "TRANSACTION")
         ).toUpperCase().trim().slice(0, 80);
