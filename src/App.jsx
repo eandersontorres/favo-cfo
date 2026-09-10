@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
-import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, splitTransaction, unsplitTransaction, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
+import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
 import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
@@ -1866,6 +1866,49 @@ function SplitModal({ txn, categories, payrollRuns = [], onClose, onSave, transa
 }
 
 // ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
+  // Carry the Kitchen invoice's line-item breakdown onto the BANK row as split
+// children. This has to live on the bank transaction, not on the
+// kitchen_purchase shadow: the shadow is deleted the moment the debit
+// reconciles, and the split would go with it.
+//
+// Best-effort by design. A failed allocation leaves the transaction exactly
+// as the single-category path left it -- the invoice is still marked paid and
+// the row still reconciled. Bookkeeping that half-applies is worse than
+// bookkeeping that does not apply.
+async function applyInvoiceSplit(txn, bill, showToast) {
+  if (!bill || bill.source !== "kitchen" || !bill.txnId) return;
+  const purchaseId = String(bill.txnId).replace(/^kitchen_purchase_/, "");
+  if (!purchaseId || purchaseId === bill.txnId) return;
+  try {
+    const buckets = await fetchPurchaseAllocation(purchaseId, TENANT_ID);
+    const rows = prorateAllocation(buckets, Math.abs(txn.amount));
+    if (rows.length < 2) return;   // one category is not a split
+    const children = rows.map(r => ({
+      date: txn.date,
+      description: txn.description,
+      amount: txn.amount < 0 ? -Math.abs(r.amount) : Math.abs(r.amount),
+      category: r.categoryId || UNCATEGORIZED,
+      account: txn.account,
+      account_id: txn.accountId || txn.account_id || null,
+      reconciled: true,
+      source: "kitchen_split",
+      notes: `From invoice ${bill.vendor}`,
+    }));
+    const res = await splitTransaction(txn.id, children, TENANT_ID);
+    if (res?.ok) {
+      const unmapped = rows.filter(r => !r.categoryId).length;
+      showToast(
+        `Split into ${rows.length} categories from the invoice` +
+        (unmapped ? " — 1 uncategorized, needs a look" : ""),
+        unmapped ? "info" : "success"
+      );
+    }
+  } catch (e) {
+    console.error("applyInvoiceSplit", e);
+  }
+}
+
+
 function Transactions({ transactions, allTransactions, setTransactions, saveTransactions, deleteTxn, categories, recurring, bankAccounts, bills = [], setBills, saveBill, tenantId, dateRange, setDateRange, showToast, payrollRuns = [] }) {
   // Split modal state — opens when the operator clicks ⫶ on a row.
   const [splittingTxn, setSplittingTxn] = useState(null);
@@ -2295,6 +2338,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     if (shadowId) deleteTxn?.(shadowId);
 
     showToast(`Invoice marked paid — ${bill.vendor} · ${fmt(bill.amount)}`, "success");
+    applyInvoiceSplit(updated, bill, showToast);
     setMatchingTxn(null);
     setInvoiceSearch("");
   };
@@ -5274,6 +5318,10 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
     const paidBills = [];
     const dropTxnIds = []; // Kitchen invoice shadows to remove
     const editTxns = [];   // real bank debits to tag with the bill's category
+    // (bank txn, ORIGINAL bill) pairs for the line-item split. Has to be the
+    // original: paidBills[].txnId is overwritten with the bank id below, and
+    // the Kitchen purchase id is only recoverable from the bill's old txnId.
+    const splitJobs = [];
 
     for (const bill of bills) {
       if (bill.status === "paid") continue;
@@ -5290,6 +5338,7 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
         notes: (bill.notes ? bill.notes + " · " : "") + "Auto-matched to bank transaction",
       });
       if (bill.source === "kitchen" && bill.txnId && bill.txnId !== m.id) dropTxnIds.push(bill.txnId);
+      splitJobs.push({ txn: m, bill });
       const needCat = (!m.category || m.category === UNCATEGORIZED) && bill.category && bill.category !== UNCATEGORIZED;
       if (needCat) editTxns.push({ ...m, category: bill.category, reconciled: true });
       else if (!m.reconciled) editTxns.push({ ...m, reconciled: true });
@@ -5311,6 +5360,16 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
       if (editTxns.length && saveTransactions) saveTransactions(editTxns);
       dropTxnIds.forEach(id => { deleteTransaction(id).catch(() => {}); });
     }
+
+    // Same line-item split the manual match applies, for the rows that got here
+    // without anyone clicking. Sequential on purpose: each call hits Supabase
+    // three times, and a bulk reconcile can carry a dozen bills.
+    (async () => {
+      for (const j of splitJobs) {
+        const t = editTxns.find(x => x.id === j.txn.id) || j.txn;
+        await applyInvoiceSplit(t, j.bill, showToast);
+      }
+    })();
 
     showToast(
       paidBills.length === 1

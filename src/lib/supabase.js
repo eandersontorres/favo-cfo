@@ -414,6 +414,116 @@ export async function fetchKitchenPurchases(tenantId, { start, end } = {}) {
 // "Sync Sales" (api/sync-square-sales). fetchKitchenStaff was also removed —
 // r7_staff has no hourly_rate column, and labor rates come from Square Labor.
 
+// ─── KITCHEN LINE-ITEM ALLOCATION ────────────────────────────────────────────
+// A single bank debit for a Restaurant Depot run covers food AND cleaning
+// supplies. Kitchen already knows which is which -- every line item carries
+// _mappedItemId -> r7_items.catId -> r7_categories -- so the CFO does not have
+// to ask the operator to split by hand. 42% of TorresBee's invoices since
+// jul/2026 are mixed.
+//
+// r7_purchases.items is a JSON string stored in a text column, so it needs
+// parsing twice in the worst case (the column holds an encoded string, not an
+// array). Tolerate both shapes rather than guessing.
+function parseItems(raw) {
+  let v = raw
+  for (let i = 0; i < 2 && typeof v === 'string'; i++) {
+    try { v = JSON.parse(v) } catch { return [] }
+  }
+  return Array.isArray(v) ? v : []
+}
+
+// The line's share of the invoice is qty * _landedUnitCost, NOT extendedPrice.
+// extendedPrice has nulls and on several lines carries the UNIT price where the
+// extended one belongs -- on one $215.59 Restaurant Depot invoice the column
+// summed to $95.84. _landedUnitCost is what Kitchen produces after allocating
+// tax and freight across the lines: over the last 120 invoices it reproduced
+// the invoice total every time, worst case off by a cent.
+function lineValue(it) {
+  const qty = parseFloat(it?.qty)
+  const landed = parseFloat(it?._landedUnitCost)
+  const unit = parseFloat(it?.unitCost)
+  const cost = Number.isFinite(landed) ? landed : unit
+  if (!Number.isFinite(qty) || !Number.isFinite(cost)) return 0
+  return qty * cost
+}
+
+/**
+ * Category breakdown for one Kitchen purchase, as ledger account ids.
+ *
+ * @returns {Promise<Array<{categoryId: string|null, amount: number}>>} buckets
+ *   in descending value. categoryId null = the item has no Kitchen category, or
+ *   its category has no entry in the map. Those are NOT dropped and NOT folded
+ *   into the biggest bucket: they surface as an uncategorized child so the
+ *   operator sees what is unclassified instead of it hiding inside food cost.
+ *   (~9.6% of value today, and it shrinks as Kitchen maps its items.)
+ *   Returns [] when the purchase is missing or has no usable lines.
+ */
+export async function fetchPurchaseAllocation(purchaseId, tenantId) {
+  const tid = tenantId || TENANT()
+  if (!purchaseId || tid === 'demo') return []
+
+  const { data: pur, error: pErr } = await supabase
+    .from('r7_purchases').select('items').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
+  if (pErr || !pur) { if (pErr) console.error('fetchPurchaseAllocation/purchase', pErr); return [] }
+
+  const items = parseItems(pur.items)
+  if (items.length === 0) return []
+
+  const mappedIds = [...new Set(items.map(i => i?._mappedItemId).filter(Boolean).map(String))]
+  const catByItem = new Map()
+  if (mappedIds.length > 0) {
+    const { data: rows, error } = await supabase
+      .from('r7_items').select('id, catId').eq('tenant_id', tid).in('id', mappedIds)
+    if (error) console.error('fetchPurchaseAllocation/items', error)
+    for (const r of (rows || [])) catByItem.set(String(r.id), r.catId == null ? null : String(r.catId))
+  }
+
+  const { data: mapRows, error: mErr } = await supabase
+    .from('r7_ledger_kitchen_category_map')
+    .select('kitchen_category_id, ledger_account_id').eq('tenant_id', tid)
+  if (mErr) console.error('fetchPurchaseAllocation/map', mErr)
+  const acctByCat = new Map((mapRows || []).map(r => [String(r.kitchen_category_id), r.ledger_account_id]))
+
+  const buckets = new Map()
+  for (const it of items) {
+    const v = lineValue(it)
+    if (v === 0) continue
+    const kcat = catByItem.get(String(it?._mappedItemId ?? ''))
+    const acct = kcat ? (acctByCat.get(kcat) || null) : null
+    buckets.set(acct, (buckets.get(acct) || 0) + v)
+  }
+
+  return [...buckets.entries()]
+    .map(([categoryId, amount]) => ({ categoryId, amount }))
+    .filter(b => Math.abs(b.amount) > 0.0001)
+    .sort((a, b) => b.amount - a.amount)
+}
+
+/**
+ * Scale a breakdown to the amount that actually left the bank and round to
+ * cents. The bank debit rarely equals the invoice to the penny -- a card fee, a
+ * partial payment, a credit applied at the register -- and the ledger's split
+ * is only valid if the children sum EXACTLY to the parent. So prorate, then put
+ * the rounding residual on the largest bucket, where it is proportionally
+ * smallest.
+ *
+ * Returns [] if the breakdown is degenerate (single bucket, or no value), since
+ * a one-category "split" is just a category.
+ */
+export function prorateAllocation(buckets, targetAbsAmount) {
+  const total = (buckets || []).reduce((s, b) => s + b.amount, 0)
+  const target = Math.abs(parseFloat(targetAbsAmount) || 0)
+  if (!(total > 0) || !(target > 0) || (buckets || []).length < 2) return []
+
+  const scaled = buckets.map(b => ({
+    categoryId: b.categoryId,
+    amount: Math.round((b.amount / total) * target * 100) / 100,
+  }))
+  const drift = Math.round((target - scaled.reduce((s, b) => s + b.amount, 0)) * 100) / 100
+  if (drift !== 0) scaled[0].amount = Math.round((scaled[0].amount + drift) * 100) / 100
+  return scaled.filter(b => b.amount !== 0)
+}
+
 export async function fetchKitchenVendors(tenantId) {
   const { data, error } = await supabase.from('r7_vendors').select('id, name, email, phone').eq('tenant_id', tenantId).order('name')
   if (error) { console.error('fetchKitchenVendors', error); return [] }
