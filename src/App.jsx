@@ -1993,11 +1993,11 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
 
   const transferPairs = detectTransferPairs(allTransactions || transactions);
 
-  const filtered = transactions.filter(t => {
-    if (filter === "income" && t.amount < 0) return false;
-    if (filter === "expense" && t.amount > 0) return false;
-    if (filter === "uncat" && t.category !== UNCATEGORIZED) return false;
-    if (filter === "cat" && (t.category === UNCATEGORIZED || !t.category)) return false;
+  // Account and search narrow the working set; the tabs slice THAT, not the
+  // whole month. Counting the tabs over `transactions` instead is what made the
+  // Uncategorized tab claim 53 rows above an empty table when a card was
+  // selected -- the count answered a question the operator had not asked.
+  const scoped = transactions.filter(t => {
     if (accountFilter === "unassigned") {
       if (t.account_id) return false;
     } else if (accountFilter !== "all") {
@@ -2008,6 +2008,24 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     if (search && !t.description.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
+
+  const matchesTab = (t, f) => {
+    if (f === "income") return t.amount > 0;
+    if (f === "expense") return t.amount < 0;
+    if (f === "uncat") return !t.category || t.category === UNCATEGORIZED;
+    if (f === "cat") return !!t.category && t.category !== UNCATEGORIZED;
+    return true;
+  };
+
+  const filtered = scoped.filter(t => matchesTab(t, filter));
+
+  const tabCounts = {
+    uncat:   scoped.filter(t => matchesTab(t, "uncat")).length,
+    cat:     scoped.filter(t => matchesTab(t, "cat")).length,
+    income:  scoped.filter(t => matchesTab(t, "income")).length,
+    expense: scoped.filter(t => matchesTab(t, "expense")).length,
+    all:     scoped.length,
+  };
 
   const [parsing, setParsing] = useState(false);
 
@@ -2457,13 +2475,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
       <div className="flex items-center gap-12 mb-16">
         <div className="tabs" style={{ marginBottom: 0 }}>
           {["uncat", "cat", "income", "expense", "all"].map(f => {
-            const counts = {
-              uncat: transactions.filter(t => t.category === UNCATEGORIZED || !t.category).length,
-              cat: transactions.filter(t => t.category && t.category !== UNCATEGORIZED).length,
-              income: transactions.filter(t => t.amount > 0).length,
-              expense: transactions.filter(t => t.amount < 0).length,
-              all: transactions.length,
-            };
+            const counts = tabCounts;
             const labels = { uncat: "Uncategorized", cat: "Categorized", income: "Income", expense: "Expenses", all: "All" };
             return (
               <div key={f} className={`tab ${filter === f ? "active" : ""}`} onClick={() => setFilter(f)}>
@@ -2476,9 +2488,15 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
           <select className="input" style={{ maxWidth: 200, fontSize: 12 }} value={accountFilter} onChange={e => setAccountFilter(e.target.value)}>
             <option value="all">All accounts</option>
             <option value="unassigned">— Unassigned —</option>
-            {bankAccounts.filter(a => a.status === "active").map(a => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
+            {bankAccounts.filter(a => a.status === "active").map(a => {
+              // Four BoA cards share the prefix "Business Adv Unlimited Cash
+              // Rewards - ####", and the select truncates at 200px -- every one
+              // of them reads as "Business Adv Unlimited Ca...". The last four
+              // digits are the only distinguishing part, so they go first.
+              const last4 = (a.name.match(/(\d{4})\s*$/) || a.name.match(/(\d{4})/) || [])[1];
+              const label = last4 ? `••${last4} · ${a.name.replace(/\s*[-·]?\s*\d{4}\s*(••\d{4})?\s*$/, "").trim()}` : a.name;
+              return <option key={a.id} value={a.id}>{label}</option>;
+            })}
           </select>
         )}
         <input className="input" style={{ maxWidth: 240 }} placeholder="Search transactions..." value={search} onChange={e => setSearch(e.target.value)} />
