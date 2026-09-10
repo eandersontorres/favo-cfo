@@ -186,7 +186,15 @@ export default async function handler(req, res) {
     }
     const salesTaxCatId = findCat(c => c.type === "transfer" && /sales\s*tax/i.test(c.name || ""));
     const tipsCatId = findCat(c => c.type === "transfer" && /tip/i.test(c.name || ""));
-    const feesCatId = findCat(c => c.tax_line === "Commissions and Fees" || /commission|fee/i.test(c.name || ""))
+    // Card processing is NOT marketplace commission, and the two must not share
+    // an account: the Payout Check screen reads them against different sources
+    // (deposits vs platform statements), and TorresBee's "Delivery Commissions"
+    // happens to carry tax_line "Commissions and Fees" -- so the old generic
+    // match sent every Square fee straight into the delivery commission line.
+    // Name the specific thing first; the generic match stays only as a floor
+    // for tenants that never split the two.
+    const feesCatId = findCat(c => /processing\s*fee|card\s*fee|merchant\s*fee/i.test(c.name || ""))
+      || findCat(c => c.tax_line === "Commissions and Fees" || /commission|fee/i.test(c.name || ""))
       || findCat(c => c.tax_line === "Other Expenses");
 
     // ─── Page through orders ────────────────────────────────────────────
