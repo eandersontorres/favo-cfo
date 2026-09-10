@@ -9733,6 +9733,201 @@ function TenantSwitcher() {
   );
 }
 
+// ─── PAYOUT CHECK ─────────────────────────────────────────────────────────────
+// Answers one question the rest of the app could not: is the money that landed
+// in the bank consistent with the sales that generated it?
+//
+// It exists because it caught something. Since the books went granular in
+// jul/2026, gross marketplace revenue kept being booked by Sync Sales while the
+// commission that pays for it stopped being booked at all — 24-25% of gross,
+// invisible, inflating profit. Nothing in the app compared the two, so nobody
+// could have seen it.
+//
+// The payout itself is never categorized: it is a settlement, the arrival of
+// money already recognized as revenue. Booking it again would double-count. The
+// number that DOES belong in the P&L is gross minus deposit — the platform's
+// cut — and that is what this screen measures against what was actually booked.
+
+// `sq_sale_<date>_<channel>` — the channel can itself contain an underscore
+// ("uber_eats"), so everything after the third segment is the channel. Splitting
+// on a fixed index silently reads "uber_eats" as "uber" and the row never
+// matches. That exact slip is what made a first pass of this analysis understate
+// gross by a third.
+function channelOf(id) {
+  const parts = String(id || "").split("_");
+  return parts.length > 3 ? parts.slice(3).join("_") : "";
+}
+
+const PAYOUT_SOURCES = [
+  {
+    key: "square", label: "Square (POS)", expense: "Processing Fee Card", lag: "next-day",
+    // Square funds the whole basket — sale, tip and the tax it collected — so
+    // all three belong on the gross side or the implied fee comes out inflated.
+    gross: (t) => (t.id?.startsWith("sq_sale_") && channelOf(t.id) === "")
+      || t.id?.startsWith("sq_tip_") || t.id?.startsWith("sq_tax_"),
+    deposit: (t) => t.source === "square_settlement",
+  },
+  { key: "doordash",  label: "DoorDash",  channel: "doordash",  deposit: /DOORDASH/i, expense: "Delivery Commissions", lag: "weekly" },
+  { key: "uber_eats", label: "Uber Eats", channel: "uber_eats", deposit: /UBER/i,     expense: "Delivery Commissions", lag: "weekly" },
+  { key: "grubhub",   label: "Grubhub",   channel: "grubhub",   deposit: /GRUBHUB/i,  expense: "Delivery Commissions", lag: "weekly" },
+  { key: "wix",       label: "Wix",       channel: "wix",       deposit: /WIX/i,      expense: "Processing Fee Card",  lag: "weekly" },
+];
+
+function PayoutCheck({ transactions, categories, dateRange }) {
+  const rows = useMemo(() => {
+    const acctByName = new Map((categories || []).map(c => [c.name, c.id]));
+    return PAYOUT_SOURCES.map(p => {
+      const isGross = p.gross || ((t) => t.id?.startsWith("sq_sale_") && channelOf(t.id) === p.channel);
+      const isDeposit = p.deposit instanceof RegExp
+        ? ((t) => t.source === "aggregator_settlement" && p.deposit.test(t.description || ""))
+        : p.deposit;
+      let gross = 0, deposited = 0, booked = 0;
+      const expenseId = acctByName.get(p.expense);
+      for (const t of transactions) {
+        if (isGross(t)) gross += t.amount;
+        else if (isDeposit(t)) deposited += t.amount;
+        if (expenseId && t.category === expenseId) booked += Math.abs(t.amount);
+      }
+      // No deposit found does NOT mean the platform kept everything -- it means
+      // its money arrives somewhere this screen cannot see (settled through
+      // Square, a differently-worded bank line, a payout still in transit).
+      // Reporting that as a 100% fee would invent an expense out of ignorance.
+      const measurable = deposited !== 0;
+      return { ...p, gross, deposited, measurable, implied: measurable ? gross - deposited : 0, booked };
+    }).filter(r => r.gross !== 0 || r.deposited !== 0);
+  }, [transactions, categories]);
+
+  // Delivery Commissions covers three platforms at once, so what was booked
+  // cannot be attributed to a single row. The comparison that means anything is
+  // per expense account, not per platform.
+  const byExpense = useMemo(() => {
+    const m = new Map();
+    for (const r of rows) {
+      const cur = m.get(r.expense) || { implied: 0, aligned: 0, booked: r.booked, platforms: [] };
+      cur.implied += r.implied;
+      // `aligned` drops the platforms whose deposits outran their sales in this
+      // window; see the alert filter below for why they cannot be trusted here.
+      if (r.measurable && r.implied > 0) { cur.aligned += r.implied; cur.platforms.push(r.label); }
+      m.set(r.expense, cur);
+    }
+    return [...m.entries()].map(([expense, v]) => ({ expense, ...v, gap: v.implied - v.booked }));
+  }, [rows]);
+
+  const days = Math.round(
+    (new Date(dateRange.end).getTime() - new Date(dateRange.start).getTime()) / 86400000
+  ) + 1;
+  // Deposits trail the sales that produced them, so a short window compares a
+  // full stretch of sales against a partial stretch of money and the percentage
+  // reads as nonsense — negative, even. Below four weeks it is not worth showing.
+  const rangeUsable = days >= 28;
+  // Only a POSITIVE gap is actionable, and only platforms whose window actually
+  // lines up can contribute to it. A negative implied fee means the window
+  // caught more money than sales -- Square funds next-day, so any range holds
+  // one extra day of the previous month -- and folding that into the total
+  // would net a real missing commission against an artefact and announce
+  // "over-booked" about a fee nobody booked.
+  const alerts = rangeUsable
+    ? byExpense
+        .map(e => ({ ...e, implied: e.aligned, gap: e.aligned - e.booked }))
+        .filter(e => e.aligned > 0 && e.gap > Math.max(50, e.aligned * 0.1))
+    : [];
+
+  return (
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <div className="page-title">Payout Check</div>
+          <div className="page-subtitle">
+            Gross sold vs money received vs fee booked · {days} day{days === 1 ? "" : "s"}
+          </div>
+        </div>
+      </div>
+
+      {!rangeUsable && (
+        <div className="card" style={{ borderColor: "var(--yellow)", background: "var(--yellowBg)", marginBottom: 16 }}>
+          <div style={{ fontSize: 13, color: "var(--text)" }}>
+            Range is {days} days — too short to read. Deposits arrive after the sales that
+            produced them, next-day for Square and up to a week for the marketplaces, so a
+            partial window compares full sales against partial money. Use a month or more.
+          </div>
+        </div>
+      )}
+
+      {alerts.map(e => (
+        <div key={e.expense} className="card" style={{ borderColor: "var(--red)", background: "var(--redBg)", marginBottom: 16 }}>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 14, color: "var(--red)", marginBottom: 6 }}>
+            {fmt(Math.abs(e.gap))} {e.gap > 0 ? "missing from" : "over-booked in"} {e.expense}
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--text2)", lineHeight: 1.5 }}>
+            The platforms kept {fmt(e.implied)} ({e.platforms.join(", ")}), and {fmt(e.booked)} is
+            in the P&amp;L. {e.gap > 0
+              ? "Revenue is booked gross, so a fee that never got booked overstates profit by the difference."
+              : "More was booked than the deposits imply — worth checking for a double entry."}
+          </div>
+        </div>
+      ))}
+
+      <div className="card" style={{ padding: 0 }}>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Platform</th>
+                <th style={{ textAlign: "right" }}>Gross sold</th>
+                <th style={{ textAlign: "right" }}>Deposited</th>
+                <th style={{ textAlign: "right" }}>Kept by platform</th>
+                <th style={{ textAlign: "right" }}>Rate</th>
+                <th>Fee account</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr><td colSpan={6}><div className="empty"><div className="empty-icon">🏦</div>
+                  <div className="empty-title">No payout activity in this range</div></div></td></tr>
+              ) : rows.map(r => {
+                const pct = (r.measurable && r.gross > 0) ? (r.implied / r.gross) * 100 : null;
+                // Marketplace commission runs 15-32%; card processing 1.5-5%.
+                // Outside the band, either the window is skewed or something is
+                // genuinely wrong — either way it deserves a look, not a verdict,
+                // so it is amber rather than red.
+                const band = r.expense === "Delivery Commissions" ? [15, 32] : [1.5, 5];
+                // A negative rate is the funding lag showing, not an anomaly:
+                // the window holds a deposit whose sale sits outside it. Flag it
+                // as such instead of raising a warning that can never be
+                // cleared -- a permanent ⚠ teaches the operator to ignore ⚠.
+                const lagged = pct !== null && pct < 0;
+                const odd = rangeUsable && !lagged && pct !== null && (pct < band[0] || pct > band[1]);
+                return (
+                  <tr key={r.key}>
+                    <td>{r.label}</td>
+                    <td className="text-right mono">{fmt(r.gross)}</td>
+                    <td className="text-right mono">{fmt(r.deposited)}</td>
+                    <td className="text-right mono">{r.measurable ? fmt(r.implied) : "—"}</td>
+                    <td className="text-right mono" style={{ color: odd ? "var(--yellow)" : "var(--text3)" }}
+                      title={!r.measurable ? "No deposit identified for this platform in this window — its money may settle through another channel."
+                        : lagged ? "Deposits in this window exceed the sales in it — the funding lag straddles the range edge." : undefined}>
+                      {pct === null ? "—" : lagged ? "lag" : pct.toFixed(1) + "%"}{odd ? " ⚠" : ""}
+                    </td>
+                    <td style={{ fontSize: 12, color: "var(--text2)" }}>{r.expense}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, fontSize: 11.5, color: "var(--text3)", lineHeight: 1.6, maxWidth: 720 }}>
+        The payout itself is never categorized — it is money already recognized as revenue when
+        the sale synced, so booking it again would count the sale twice. What belongs in the
+        P&amp;L is the slice the platform kept, the "Kept by platform" column. Deposits trail
+        sales, so figures at the edge of a range shift by roughly a day of volume for Square and
+        up to a week for the marketplaces.
+      </div>
+    </div>
+  );
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [screen, setScreen] = useState("dashboard");
@@ -10093,6 +10288,7 @@ export default function App() {
     { id: "accounts", label: "Bank Accounts", icon: "wallet", badge: bankAccounts.filter(a => a.status === "active").length || null },
     { id: "favobank", label: "Favo Bank", icon: "bank" },
     { id: "reconcile", label: "Reconciliation", icon: "reconcile" },
+    { id: "payouts", label: "Payout Check", icon: "reconcile", indent: 1 },
     { id: "tax", label: "Tax Summary", icon: "tax" },
   ].filter(item => supports(item.id));
 
@@ -10117,6 +10313,7 @@ export default function App() {
       case "accounts":     return <BankAccounts accounts={bankAccounts} setAccounts={setBankAccounts} saveBankAccount={saveBankAccount} deleteAcc={async(id)=>{setBankAccounts(p=>p.filter(a=>a.id!==id));if(TENANT_ID!=="demo")await deleteBankAccount(id);}} transactions={transactions} showToast={showToast} />;
       case "favobank":     return <FavoBank tenantId={TENANT_ID} onSync={() => loadAll(false)} showToast={showToast} />;
       case "reconcile":    return <Reconciliation transactions={filteredByDate} setTransactions={setTransactions} saveTransactions={saveTransactions} categories={categories} tenantId={TENANT_ID} dateRange={dateRange} showToast={showToast} />;
+      case "payouts":      return <PayoutCheck transactions={filteredByDate} categories={categories} dateRange={dateRange} />;
       case "tax":          return <TaxSummary transactions={filteredByAccrual} allTransactions={transactions} categories={categories} dateRange={dateRange} />;
       default: return null;
     }
