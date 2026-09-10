@@ -2055,8 +2055,25 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
   // whole month. Counting the tabs over `transactions` instead is what made the
   // Uncategorized tab claim 53 rows above an empty table when a card was
   // selected -- the count answered a question the operator had not asked.
+  // Cards the BoA consolidation swallowed. Since 2026-08-17 every charge posts
+  // to the CORP account, so filtering by the card's own account returns nothing
+  // even though the charges exist -- the card is named in Plaid's account_owner
+  // instead, which the sync stores as a `cardholder:` tag. Offering those as
+  // filter options is what makes "show me what went on 8349" work again.
+  const cardholderTags = useMemo(() => {
+    const set = new Set();
+    for (const t of transactions) {
+      for (const g of (Array.isArray(t.tags) ? t.tags : [])) {
+        if (String(g).startsWith("cardholder:")) set.add(String(g));
+      }
+    }
+    return [...set].sort();
+  }, [transactions]);
+
   const scoped = transactions.filter(t => {
-    if (accountFilter === "unassigned") {
+    if (accountFilter.startsWith("cardholder:")) {
+      if (!(Array.isArray(t.tags) && t.tags.includes(accountFilter))) return false;
+    } else if (accountFilter === "unassigned") {
       if (t.account_id) return false;
     } else if (accountFilter !== "all") {
       const acc = (bankAccounts || []).find(a => a.id === accountFilter);
@@ -2555,6 +2572,15 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
               const label = last4 ? `••${last4} · ${a.name.replace(/\s*[-·]?\s*\d{4}\s*(••\d{4})?\s*$/, "").trim()}` : a.name;
               return <option key={a.id} value={a.id}>{label}</option>;
             })}
+            {cardholderTags.length > 0 && (
+              <optgroup label="By card (BoA consolidated)">
+                {cardholderTags.map(g => {
+                  const name = g.slice("cardholder:".length);
+                  const last4 = (name.match(/(\d{4})\s*$/) || [])[1];
+                  return <option key={g} value={g}>{last4 ? `••${last4} · on CORP` : name}</option>;
+                })}
+              </optgroup>
+            )}
           </select>
         )}
         <input className="input" style={{ maxWidth: 240 }} placeholder="Search transactions..." value={search} onChange={e => setSearch(e.target.value)} />
