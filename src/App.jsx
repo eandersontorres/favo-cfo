@@ -35,8 +35,8 @@ const STYLES = `
     --border: rgba(255,255,255,0.08);
     --border2: rgba(255,255,255,0.14);
     --text: #E8ECED;
-    --text2: #93A1A6;
-    --text3: #6C7A7E;
+    --text2: #A3B0B4;
+    --text3: #7E8C90;
     --accent: #46BC88;   /* cfo-signal */
     --accent2: #5ECD9C;
     --accentBg: rgba(70,188,136,0.10);
@@ -63,8 +63,8 @@ const STYLES = `
     --border: #E8E8E5;
     --border2: #D9D9D5;
     --text: #0A0A0A;
-    --text2: #5A5A5A;
-    --text3: #9A9A9A;
+    --text2: #4A4A4A;
+    --text3: #6B6B6B;
     --accent: #2E7D5B;   /* cfo-deep */
     --accent2: #256A4C;
     --accentBg: rgba(46,125,91,0.08);
@@ -2450,7 +2450,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
                 <tr><td colSpan={7}><div className="empty"><div className="empty-icon">🔍</div><div className="empty-title">No transactions found</div></div></td></tr>
               ) : filtered.map(t => (
                 <tr key={t.id}>
-                  <td className="mono" style={{ color: "var(--text3)", whiteSpace: "nowrap" }}>{fmtDate(t.date)}</td>
+                  <td className="mono" style={{ color: "var(--text2)", whiteSpace: "nowrap" }}>{fmtDate(t.date)}</td>
                   <td style={{ maxWidth: 320 }}>
                     <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.description}</div>
                     {(() => {
@@ -5205,7 +5205,7 @@ function Reconciliation({ transactions, setTransactions, saveTransactions, categ
                 const cat = categories.find(c => c.id === t.category);
                 return (
                   <tr key={t.id}>
-                    <td className="mono" style={{ color: "var(--text3)" }}>{fmtDate(t.date)}</td>
+                    <td className="mono" style={{ color: "var(--text2)" }}>{fmtDate(t.date)}</td>
                     <td>{t.description}</td>
                     <td>{cat && <span className="tag" style={{ background: cat.color + "18", color: cat.color, border: `1px solid ${cat.color}30` }}>{cat.name}</span>}</td>
                     <td className="amount-neg text-right">{fmt(t.amount)}</td>
