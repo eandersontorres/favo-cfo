@@ -17,6 +17,8 @@
 // the redirect URI must be registered in the Plaid dashboard. In sandbox you log
 // in with the fake credentials user_good / pass_good against any test bank.
 
+import { createClient } from "@supabase/supabase-js";
+
 const PLAID_HOSTS = {
   sandbox: "https://sandbox.plaid.com",
   development: "https://development.plaid.com",
@@ -34,7 +36,7 @@ export default async function handler(req, res) {
   const base = PLAID_HOSTS[env] || PLAID_HOSTS.sandbox;
   if (!clientId || !secret) return res.status(500).json({ error: "PLAID_CLIENT_ID / PLAID_SECRET not configured" });
 
-  const { tenant_id } = req.body || {};
+  const { tenant_id, mode } = req.body || {};
   if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
 
   try {
@@ -47,6 +49,38 @@ export default async function handler(req, res) {
       country_codes: ["US"],
       language: "en",
     };
+
+    // UPDATE MODE — re-authenticate the EXISTING item instead of creating a new
+    // one. This is the difference between a repair and a re-import: a fresh link
+    // gives the same charges brand-new transaction_ids, and since the ledger
+    // dedupes by id every one of them lands again as a duplicate. The last
+    // from-scratch re-link (2026-07-22) had to park 76 rows worth $41k in
+    // r7_ledger_txns_backup_plaid_old_item. Update mode keeps the item_id, the
+    // access_token, the transaction ids and the sync cursor, so nothing
+    // re-imports.
+    //
+    // Plaid rejects `products` together with `access_token`, so it goes.
+    if (mode === "update") {
+      const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+      const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (!url || !serviceKey) return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured" });
+      const supabase = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+      const { data: items, error } = await supabase
+        .from("r7_ledger_plaid_items")
+        .select("access_token")
+        .eq("tenant_id", tenant_id)
+        .eq("status", "active")
+        .limit(1);
+      if (error) return res.status(500).json({ error: "load plaid item: " + error.message });
+      if (!items || items.length === 0) {
+        // Nothing to repair. Say so rather than silently opening a fresh link:
+        // the caller asked to fix a connection that does not exist, and the
+        // duplicate-free guarantee above would not apply.
+        return res.status(409).json({ error: "no_active_item" });
+      }
+      body.access_token = items[0].access_token;
+      delete body.products;
+    }
     // OAuth banks (Bank of America, Chase, etc.) require a registered redirect URI.
     const redirect = (process.env.PLAID_REDIRECT_URI || "").trim();
     if (redirect) body.redirect_uri = redirect;

@@ -600,11 +600,18 @@ export async function syncSquareSales(tenantId, range = {}) {
 // ─── PLAID (bank connection) ──────────────────────────────────────────────────
 // Three thin wrappers over the /api/plaid-* serverless functions. The access
 // token never touches the browser — these only move public tokens and counts.
-export async function createPlaidLinkToken(tenantId) {
+/**
+ * @param {string} tenantId
+ * @param {'create'|'update'} mode 'update' re-authenticates the EXISTING Plaid
+ *   item -- same item_id, same access_token, same transaction ids, same cursor,
+ *   so nothing re-imports. 'create' (default) links a bank for the first time.
+ *   Throws 'no_active_item' if asked to update with nothing connected.
+ */
+export async function createPlaidLinkToken(tenantId, mode = 'create') {
   const res = await fetch('/api/plaid-link-token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tenant_id: tenantId }),
+    body: JSON.stringify({ tenant_id: tenantId, mode }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Server error ' + res.status }))

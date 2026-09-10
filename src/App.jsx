@@ -1256,6 +1256,52 @@ function loadPlaidLink() {
 // every click after that just runs an incremental /transactions/sync.
 // Bank of America requires Plaid in production with OAuth (see api/plaid-*.js).
 const PLAID_TOKEN_KEY = "clariva_plaid_link_token";
+// Which flow stashed the token above. OAuth banks reload the whole page, so the
+// resume handler has no memory of why Link was opened -- and the two flows end
+// differently: a first-time link must exchange the public_token for an access
+// token, an update-mode repair must NOT (the existing access_token stays valid,
+// and exchanging would mint a second item, which is exactly the duplicate-import
+// this feature exists to avoid).
+const PLAID_MODE_KEY = "clariva_plaid_link_mode";
+
+// Opens Plaid Link in UPDATE mode against the item already connected. Keeps the
+// item_id, access_token, transaction ids and sync cursor -- so re-authenticating
+// a bank that went stale costs nothing and re-imports nothing.
+async function openPlaidUpdate(tenantId, showToast, onDone) {
+  try {
+    const Plaid = await loadPlaidLink();
+    const { link_token } = await createPlaidLinkToken(tenantId, "update");
+    localStorage.setItem(PLAID_TOKEN_KEY, link_token);
+    localStorage.setItem(PLAID_MODE_KEY, "update");
+    const cleanup = () => {
+      localStorage.removeItem(PLAID_TOKEN_KEY);
+      localStorage.removeItem(PLAID_MODE_KEY);
+    };
+    Plaid.create({
+      token: link_token,
+      onSuccess: async () => {
+        // Deliberately no exchange -- see PLAID_MODE_KEY.
+        cleanup();
+        showToast("Bank re-authenticated. Pulling transactions...", "info");
+        try {
+          await syncPlaidTransactions(tenantId);
+          showToast("Connection repaired & synced", "success");
+          onDone?.();
+        } catch (e) { showToast("Synced failed after repair: " + e.message, "error"); }
+      },
+      onExit: (err) => {
+        cleanup();
+        if (err) showToast("Bank login failed: " + (err.display_message || err.error_message || "cancelled"), "error");
+      },
+    }).open();
+  } catch (e) {
+    if (String(e.message).includes("no_active_item")) {
+      showToast("No bank connected yet — use Sync Bank first.", "error");
+    } else {
+      showToast("Could not open bank login: " + e.message, "error");
+    }
+  }
+}
 
 function BankSyncButton({ tenantId, onSync, showToast }) {
   const [loading, setLoading] = useState(false);
@@ -1276,16 +1322,23 @@ function BankSyncButton({ tenantId, onSync, showToast }) {
         const Plaid = await loadPlaidLink();
         const cleanup = () => {
           localStorage.removeItem(PLAID_TOKEN_KEY);
+          localStorage.removeItem(PLAID_MODE_KEY);
           window.history.replaceState({}, "", window.location.pathname);
         };
         const handler = Plaid.create({
           token: link_token,
           receivedRedirectUri: window.location.href,
           onSuccess: async (public_token, metadata) => {
+            const wasUpdate = localStorage.getItem(PLAID_MODE_KEY) === "update";
             cleanup();
             try {
-              await exchangePlaidPublicToken(tenantId, public_token, metadata?.institution?.name || "Bank", metadata?.institution?.institution_id || null);
-              showToast("Bank connected. Pulling transactions...", "info");
+              // Update mode repairs the existing item -- exchanging here would
+              // mint a SECOND item and re-import every transaction under new
+              // ids. See PLAID_MODE_KEY.
+              if (!wasUpdate) {
+                await exchangePlaidPublicToken(tenantId, public_token, metadata?.institution?.name || "Bank", metadata?.institution?.institution_id || null);
+              }
+              showToast(wasUpdate ? "Bank re-authenticated. Pulling transactions..." : "Bank connected. Pulling transactions...", "info");
               await syncPlaidTransactions(tenantId);
               setLastSync(new Date());
               if (onSync) onSync();
@@ -1308,6 +1361,7 @@ function BankSyncButton({ tenantId, onSync, showToast }) {
       const { link_token } = await createPlaidLinkToken(tenantId);
       // Stash before opening so an OAuth full-page redirect can resume (above).
       localStorage.setItem(PLAID_TOKEN_KEY, link_token);
+      localStorage.setItem(PLAID_MODE_KEY, "create");
       const handler = Plaid.create({
         token: link_token,
         onSuccess: async (public_token, metadata) => {
@@ -6847,6 +6901,7 @@ function BankAccounts({ accounts, setAccounts, saveBankAccount, deleteAcc, trans
   };
   const [form, setForm] = useState(blankForm);
   const [filterStatus, setFilterStatus] = useState("active");
+  const [reconnecting, setReconnecting] = useState(false);
 
   const filtered = accounts.filter(a => filterStatus === "all" ? true : a.status === filterStatus);
   const active = accounts.filter(a => a.status === "active");
@@ -6939,7 +6994,21 @@ function BankAccounts({ accounts, setAccounts, saveBankAccount, deleteAcc, trans
           <div className="page-title">Bank Accounts</div>
           <div className="page-subtitle">{active.length} active · cash position consolidated across all accounts</div>
         </div>
-        <button className="btn btn-primary btn-sm" onClick={openAdd}><Icon name="plus" size={13} /> New Account</button>
+        <div className="flex items-center gap-10">
+          {/* Secondary, not primary: the brand rule keeps one accent action per
+              screen, and creating an account is the common one. Repairing a
+              connection is the rare one you go looking for. */}
+          <button className="btn btn-outline btn-sm" disabled={reconnecting}
+            onClick={async () => {
+              setReconnecting(true);
+              await openPlaidUpdate(TENANT_ID, showToast, () => window.location.reload());
+              setReconnecting(false);
+            }}
+            title="Re-authenticate the bank without re-importing anything">
+            {reconnecting ? "Opening…" : "Reconnect bank"}
+          </button>
+          <button className="btn btn-primary btn-sm" onClick={openAdd}><Icon name="plus" size={13} /> New Account</button>
+        </div>
       </div>
 
       <div className="kpi-grid" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
