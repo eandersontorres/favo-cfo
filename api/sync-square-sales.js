@@ -275,6 +275,11 @@ export default async function handler(req, res) {
     // rewrites them, which is fine: sq_fee ids are deterministic per day and
     // the upsert corrects them in place.
     const feeByDay = {};
+    // Cash tendered per local day. Same pass as the fees -- the payment carries
+    // both, and the cash total is the only way to tell what SHOULD have reached
+    // the bank. It is reference data, never a ledger row: the sale is already in
+    // revenue via sq_sale_<date>, which counts items regardless of tender.
+    const cashByDay = {};
     {
       let pCursor;
       let pPages = 0;
@@ -308,6 +313,16 @@ export default async function handler(req, res) {
           const date = new Date(at).toLocaleDateString("en-CA", { timeZone: tenantTz });
           for (const f of pay.processing_fee || []) {
             feeByDay[date] = (feeByDay[date] || 0) + (f.amount_money?.amount || 0);
+          }
+          // total_money, not amount_money: what the customer actually handed
+          // over includes the tip. A cash tip is cash in the drawer that has to
+          // reach the bank like any other note, so leaving it out would make the
+          // deposit look permanently larger than the sale.
+          if (pay.source_type === "CASH") {
+            const c = cashByDay[date] || { cents: 0, n: 0 };
+            c.cents += pay.total_money?.amount || 0;
+            c.n += 1;
+            cashByDay[date] = c;
           }
         }
         pCursor = payData.cursor;
@@ -495,6 +510,20 @@ export default async function handler(req, res) {
       if (upErr) return res.status(500).json({ error: "upsert sale/fee rows: " + upErr.message });
     }
 
+    // Cash reference table. Deliberately NOT part of rowsToWrite -- it is not a
+    // ledger entry, and a failure here must not take the sales sync down with
+    // it, so the error is reported rather than thrown.
+    let cashError = null;
+    const cashRows = Object.entries(cashByDay).map(([date, c]) => ({
+      tenant_id, date, cash_cents: c.cents, payments: c.n, updated_at: new Date().toISOString(),
+    }));
+    if (cashRows.length > 0) {
+      const { error: cashErr } = await supabase
+        .from("r7_square_cash_daily")
+        .upsert(cashRows, { onConflict: "tenant_id,date" });
+      if (cashErr) cashError = cashErr.message;
+    }
+
     // Window in LOCAL dates (the same calendar rows are keyed by). Slicing
     // beginTime/endTime would be the UTC date — one day off at the end
     // boundary, which matters below where rows get deleted.
@@ -591,6 +620,8 @@ export default async function handler(req, res) {
         .filter(([k]) => k !== "__error")
         .reduce((s2, [, v]) => s2 + v, 0) || sumCents(c => c.fee_cents),
       processing_fees_error: feeByDay.__error || null,
+      cash_tendered: Object.values(cashByDay).reduce((s2, c) => s2 + c.cents, 0),
+      cash_error: cashError,
       net_sales: sumCents(c => c.items_cents + c.non_tip_sc_cents - c.discount_cents - c.return_cents),
     };
     const by_channel = {};

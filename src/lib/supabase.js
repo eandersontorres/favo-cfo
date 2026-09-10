@@ -530,6 +530,19 @@ export async function fetchKitchenVendors(tenantId) {
   return data
 }
 
+// Dinheiro recebido por dia (tender CASH do Square). Referência para conferir
+// contra o depósito de caixa no banco -- não é lançamento, a venda já está na
+// receita via sq_sale_<data>.
+export async function fetchSquareCashDaily(tenantId, { start, end } = {}) {
+  let q = supabase.from('r7_square_cash_daily').select('date, cash_cents, payments')
+    .eq('tenant_id', tenantId).order('date')
+  if (start) q = q.gte('date', start)
+  if (end)   q = q.lte('date', end)
+  const { data, error } = await q
+  if (error) { console.error('fetchSquareCashDaily', error); return [] }
+  return data || []
+}
+
 export async function fetchTenant(tenantId) {
   const { data, error } = await supabase.from('r7_tenants').select('*').eq('id', tenantId).single()
   if (error) { console.error('fetchTenant', error); return null }

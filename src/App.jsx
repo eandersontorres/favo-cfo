@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
-import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
+import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
 import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
@@ -9774,6 +9774,20 @@ const PAYOUT_SOURCES = [
 ];
 
 function PayoutCheck({ transactions, categories, dateRange }) {
+  // Cash is the one revenue source with no counterpart in the ledger: the sale
+  // is booked, the deposit is booked, and what the customer actually handed over
+  // lives only in Square. Fetched here rather than threaded through App because
+  // this is the only screen that needs it -- same shape as Reconciliation.
+  const [cashDaily, setCashDaily] = useState(null);
+  useEffect(() => {
+    if (TENANT_ID === "demo") { setCashDaily([]); return; }
+    let cancelled = false;
+    fetchSquareCashDaily(TENANT_ID, dateRange).then(rows => {
+      if (!cancelled) setCashDaily(rows || []);
+    });
+    return () => { cancelled = true; };
+  }, [dateRange.start, dateRange.end]);
+
   const rows = useMemo(() => {
     const acctByName = new Map((categories || []).map(c => [c.name, c.id]));
     return PAYOUT_SOURCES.map(p => {
@@ -9796,6 +9810,24 @@ function PayoutCheck({ transactions, categories, dateRange }) {
       return { ...p, gross, deposited, measurable, implied: measurable ? gross - deposited : 0, booked };
     }).filter(r => r.gross !== 0 || r.deposited !== 0);
   }, [transactions, categories]);
+
+  // Cash gets its own row because the gap means something different. On a
+  // platform the difference between sold and received is a fee: contractual,
+  // expected, and the thing to book. On cash it is money that did not arrive --
+  // petty expense paid from the drawer, a tip handed over in notes, or a
+  // shortfall. Nothing to book, everything to ask about. So it is never folded
+  // into the fee alerts above.
+  const cashRow = useMemo(() => {
+    if (!cashDaily) return null;
+    const sold = cashDaily.reduce((s2, d) => s2 + (d.cash_cents || 0), 0) / 100;
+    let deposited = 0;
+    for (const t of transactions) {
+      const cat = (categories || []).find(c => c.id === t.category);
+      if (cat && cat.name === "Cash Deposit") deposited += t.amount;
+    }
+    if (sold === 0 && deposited === 0) return null;
+    return { sold, deposited, gap: sold - deposited };
+  }, [cashDaily, transactions, categories]);
 
   // Delivery Commissions covers three platforms at once, so what was booked
   // cannot be attributed to a single row. The comparison that means anything is
@@ -9912,10 +9944,36 @@ function PayoutCheck({ transactions, categories, dateRange }) {
                   </tr>
                 );
               })}
+              {cashRow && (
+                <tr style={{ borderTop: "2px solid var(--border2)" }}>
+                  <td>Cash <span style={{ fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>· drawer → bank</span></td>
+                  <td className="text-right mono">{fmt(cashRow.sold)}</td>
+                  <td className="text-right mono">{fmt(cashRow.deposited)}</td>
+                  <td className="text-right mono"
+                    style={{ color: Math.abs(cashRow.gap) > Math.max(100, cashRow.sold * 0.05) ? "var(--yellow)" : "var(--text2)" }}>
+                    {fmt(cashRow.gap)}
+                  </td>
+                  <td className="text-right mono" style={{ color: "var(--text3)" }}>n/a</td>
+                  <td style={{ fontSize: 12, color: "var(--text2)" }}>—</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
       </div>
+
+      {cashRow && Math.abs(cashRow.gap) > Math.max(100, cashRow.sold * 0.05) && (
+        <div className="card" style={{ borderColor: "var(--yellow)", background: "var(--yellowBg)", marginTop: 12 }}>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 14, color: "var(--yellow)", marginBottom: 6 }}>
+            {fmt(Math.abs(cashRow.gap))} {cashRow.gap > 0 ? "of cash never reached the bank" : "more deposited than sold in cash"}
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--text2)", lineHeight: 1.5 }}>
+            {cashRow.gap > 0
+              ? "Usually petty expenses paid from the drawer or tips handed out in notes — both are real and both belong in the books. Worth knowing which."
+              : "More cash was banked than Square recorded as cash sales. Check for a deposit that was not a cash sale, or a sale rung up under the wrong tender."}
+          </div>
+        </div>
+      )}
 
       <div style={{ marginTop: 12, fontSize: 11.5, color: "var(--text3)", lineHeight: 1.6, maxWidth: 720 }}>
         The payout itself is never categorized — it is money already recognized as revenue when
