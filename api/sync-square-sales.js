@@ -254,6 +254,58 @@ export default async function handler(req, res) {
       return_cents: 0,
       fee_cents: 0,
     });
+    // ─── Processing fees — Payments API, not Orders ─────────────────────
+    // The tender loop below reads tender.processing_fee_money, and Square
+    // simply does not populate it on /v2/orders responses: sq_fee_* had never
+    // written a single row, so card processing sat at $0 in the P&L from the
+    // day the books went granular while ~$2.8k/month was really being charged.
+    //
+    // The fee lives on the PAYMENT. Each payment carries a processing_fee
+    // array (one entry per fee component, refunds included as negatives), and
+    // it appears only once the payment settles -- a day or two after the sale.
+    // So the last couple of days of any window under-report until a later sync
+    // rewrites them, which is fine: sq_fee ids are deterministic per day and
+    // the upsert corrects them in place.
+    const feeByDay = {};
+    {
+      let pCursor;
+      let pPages = 0;
+      do {
+        pPages++;
+        if (pPages > 50) break;
+        const qs = new URLSearchParams({
+          begin_time: beginTime,
+          end_time: endTime,
+          location_id: locationId,
+          limit: "100",
+        });
+        if (pCursor) qs.set("cursor", pCursor);
+        const payRes = await fetch(`${base}/v2/payments?${qs}`, {
+          headers: {
+            "Authorization": "Bearer " + token,
+            "Square-Version": SQUARE_VERSION,
+          },
+        });
+        if (!payRes.ok) {
+          // A missing PAYMENTS_READ scope must not take the whole sync down --
+          // sales are the reason this endpoint exists. Report it and move on
+          // with zero fees rather than failing the run.
+          feeByDay.__error = `Square Payments ${payRes.status}: ${(await payRes.text()).slice(0, 200)}`;
+          break;
+        }
+        const payData = await payRes.json();
+        for (const pay of payData.payments || []) {
+          const at = pay.created_at;
+          if (!at) continue;
+          const date = new Date(at).toLocaleDateString("en-CA", { timeZone: tenantTz });
+          for (const f of pay.processing_fee || []) {
+            feeByDay[date] = (feeByDay[date] || 0) + (f.amount_money?.amount || 0);
+          }
+        }
+        pCursor = payData.cursor;
+      } while (pCursor);
+    }
+
     const byDay = {};
     for (const order of allOrders) {
       const closed = order.closed_at;
@@ -341,7 +393,7 @@ export default async function handler(req, res) {
           ownTipCents += c.tip_cents;
           ownAutoGratCents += c.auto_grat_cents;
         }
-        feeCents += c.fee_cents;
+        feeCents += c.fee_cents;   // fallback: only ever non-zero if Square starts populating tenders
 
         if (netSalesCents !== 0) {
           rowsToWrite.push({
@@ -407,18 +459,22 @@ export default async function handler(req, res) {
           skipped_tip++;
         }
       }
-      if (feeCents > 0) {
+      // Payments API is the real source; the tender sum stays as a fallback in
+      // case Square ever starts populating it. Never add them -- that would
+      // double the fee the day both are present.
+      const dayFeeCents = feeByDay[day.date] || feeCents;
+      if (dayFeeCents > 0) {
         rowsToWrite.push({
           id: `sq_fee_${day.date}`,
           tenant_id,
           date: day.date,
           description: "SQUARE PROCESSING FEES",
-          amount: -Math.round(feeCents) / 100,
+          amount: -Math.round(dayFeeCents) / 100,
           category_id: feesCatId,
           account: "Square POS",
           reconciled: true,
           source: "square_fee",
-          notes: "",
+          notes: feeByDay[day.date] ? "From Square Payments API (settled fees)" : "",
           tags: [],
         });
       }
@@ -445,6 +501,12 @@ export default async function handler(req, res) {
     // after a refund. Every local date in [beginDate, endDate] was fully
     // recomputed (the order window is timezone-aligned), so any sq_sale row
     // in that range we didn't just write is stale.
+    // square_fee is deliberately NOT swept here. Its id is deterministic per
+    // day, so a re-run overwrites it in place; but if the Payments call fails
+    // (scope revoked, Square hiccup) the run writes no fee row at all, and a
+    // sweep would then delete a correct fee that is simply unconfirmed this
+    // pass. Leaving fee rows sticky loses nothing -- a wrong one is corrected
+    // by the next successful run.
     const expectedIds = new Set(rowsToWrite.map(r => r.id));
     const { data: existingSaleRows } = await supabase
       .from("r7_ledger_transactions")
@@ -517,7 +579,10 @@ export default async function handler(req, res) {
       marketplace_tips: mktOnly(c => c.tip_cents),
       discounts: sumCents(c => c.discount_cents),
       returns: sumCents(c => c.return_cents),
-      processing_fees: sumCents(c => c.fee_cents),
+      processing_fees: Object.entries(feeByDay)
+        .filter(([k]) => k !== "__error")
+        .reduce((s2, [, v]) => s2 + v, 0) || sumCents(c => c.fee_cents),
+      processing_fees_error: feeByDay.__error || null,
       net_sales: sumCents(c => c.items_cents + c.non_tip_sc_cents - c.discount_cents - c.return_cents),
     };
     const by_channel = {};
