@@ -2070,13 +2070,29 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     return [...set].sort();
   }, [transactions]);
 
+  // A <select> whose value matches no <option> silently displays the FIRST one,
+  // so a stale filter reads as "All accounts" while quietly hiding every row --
+  // which is exactly what happened when the cardholder options (which only
+  // exist for dates the BoA consolidation covers) vanished on switching to an
+  // earlier month: the table emptied and the control claimed nothing was
+  // filtered. Reset to "all" whenever the selection is no longer offered.
+  const accountFilterValid = accountFilter === "all"
+    || accountFilter === "unassigned"
+    || cardholderTags.includes(accountFilter)
+    || (bankAccounts || []).some(a => a.id === accountFilter && a.status === "active");
+  useEffect(() => {
+    if (!accountFilterValid) setAccountFilter("all");
+  }, [accountFilterValid]);
+
+  const effectiveAccountFilter = accountFilterValid ? accountFilter : "all";
+
   const scoped = transactions.filter(t => {
-    if (accountFilter.startsWith("cardholder:")) {
-      if (!(Array.isArray(t.tags) && t.tags.includes(accountFilter))) return false;
-    } else if (accountFilter === "unassigned") {
+    if (effectiveAccountFilter.startsWith("cardholder:")) {
+      if (!(Array.isArray(t.tags) && t.tags.includes(effectiveAccountFilter))) return false;
+    } else if (effectiveAccountFilter === "unassigned") {
       if (t.account_id) return false;
-    } else if (accountFilter !== "all") {
-      const acc = (bankAccounts || []).find(a => a.id === accountFilter);
+    } else if (effectiveAccountFilter !== "all") {
+      const acc = (bankAccounts || []).find(a => a.id === effectiveAccountFilter);
       if (!acc) return false;
       if (t.account_id !== acc.id && t.account !== acc.name) return false;
     }
@@ -2560,7 +2576,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
           })}
         </div>
         {bankAccounts && bankAccounts.length > 0 && (
-          <select className="input" style={{ maxWidth: 200, fontSize: 12 }} value={accountFilter} onChange={e => setAccountFilter(e.target.value)}>
+          <select className="input" style={{ maxWidth: 200, fontSize: 12 }} value={effectiveAccountFilter} onChange={e => setAccountFilter(e.target.value)}>
             <option value="all">All accounts</option>
             <option value="unassigned">— Unassigned —</option>
             {bankAccounts.filter(a => a.status === "active").map(a => {
