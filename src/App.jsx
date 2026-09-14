@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "rea
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
 import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
+import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
 import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
 
@@ -8815,6 +8816,26 @@ function Bookkeeper({ transactions, allTransactions, categories, setTransactions
   );
 }
 
+// ─── MODULE LOCKED — plan gate (favo_app_access) said this tenant lacks CFO ───
+// Keeps the TenantSwitcher so a multi-store manager can jump to a store that
+// has the module.
+function ModuleLocked({ result }) {
+  return (
+    <><style>{STYLES}</style>
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg)", padding: 20 }}>
+        <div className="card" style={{ maxWidth: 420, padding: 32, textAlign: "center" }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>🔒</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text)", marginBottom: 8 }}>Favo CFO</div>
+          <div style={{ fontSize: 13, color: "var(--text2)", marginBottom: 6 }}>{lockMessage(result)}</div>
+          <div style={{ fontSize: 13, color: "var(--text2)", marginBottom: 20 }}>Fale com a Favo para liberar.</div>
+          <div style={{ marginBottom: 12, textAlign: "left" }}><TenantSwitcher /></div>
+          <button className="btn btn-outline btn-sm" onClick={() => signOutUser()}>Sair</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ─── LOGIN ────────────────────────────────────────────────────────────────────
 function LoginScreen() {
   const [email, setEmail] = useState("");
@@ -10049,6 +10070,11 @@ export default function App() {
     return () => { cancelled = true; };
   }, [session]);
 
+  // Plan gate (favo_app_access): runs once logged in AND authorized for
+  // TENANT_ID (r7 id space). Fail-open — see lib/appAccess.js.
+  const gateOn = TENANT_ID !== "demo" && !!session && authorized;
+  const access = useAppAccess(session?.user?.id, TENANT_ID, gateOn);
+
   // Country pack reconciliation. initCountry() already applied the cached pack
   // synchronously at module load, so this only does visible work the first time
   // a tenant is opened on this device, or when its country actually changes in
@@ -10413,6 +10439,10 @@ export default function App() {
         </>
       );
     }
+    if (access.status === "checking") {
+      return (<><style>{STYLES}</style><div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg)", color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 13 }}>Loading…</div></>);
+    }
+    if (access.status === "blocked") return <ModuleLocked result={access.result} />;
   }
 
   return (
