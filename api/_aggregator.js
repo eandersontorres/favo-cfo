@@ -132,7 +132,9 @@ const normalizePayout = (p) => ({
 // Runs the statement through Claude and hands back a normalized envelope.
 // Never throws for expected failures — returns { ok:false, status, error }
 // so both callers can map it straight onto an HTTP response.
-export async function parseStatement({ pdfBase64, csvText, filename, platformHint, apiKey }) {
+// onUsage({ model, messageId, usage }) opcional: chamado assim que o Anthropic
+// responde (tokens ja gastos, mesmo que o parse falhe depois) — pro metering.
+export async function parseStatement({ pdfBase64, csvText, filename, platformHint, apiKey, onUsage }) {
   if (!apiKey) return { ok: false, status: 500, error: 'ANTHROPIC_API_KEY not configured.' };
   if (!pdfBase64 && !csvText) return { ok: false, status: 400, error: 'Either pdfBase64 or csvText is required' };
 
@@ -173,6 +175,7 @@ export async function parseStatement({ pdfBase64, csvText, filename, platformHin
     let apiData;
     try { apiData = JSON.parse(rawBody); }
     catch { return { ok: false, status: 502, error: 'Invalid response from Anthropic', detail: rawBody.slice(0, 200) }; }
+    if (onUsage) await onUsage({ model: 'claude-opus-4-5', messageId: apiData.id, usage: apiData.usage });
 
     const rawText = (apiData.content?.[0]?.text || '').trim();
     if (!rawText) return { ok: false, status: 422, error: 'Empty response — statement may be unreadable.' };

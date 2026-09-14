@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "rea
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
 import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
-import { getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
+import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
 import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
 
 // Active tenant: localStorage override (set by the sidebar TenantSwitcher) wins
@@ -2137,7 +2137,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
         });
         const apiRes = await fetch("/api/parse-statement", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: await aiAuthHeaders(),
           body: JSON.stringify({ pdfBase64: base64, filename: file.name }),
         });
         if (!apiRes.ok) {
@@ -7691,7 +7691,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
       });
       const apiRes = await fetch("/api/parse-paystub", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await aiAuthHeaders(),
         body: JSON.stringify({ pdfBase64: base64, filename: file.name }),
       });
       if (!apiRes.ok) {

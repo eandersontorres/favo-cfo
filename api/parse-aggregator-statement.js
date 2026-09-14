@@ -10,6 +10,7 @@
 // (ingest-aggregator-email.js) parses statements exactly the same way.
 
 import { parseStatement } from './_aggregator.js';
+import { authorize, meterUsage } from './_lib/anthropicProxy.js';
 
 export const config = {
   api: {
@@ -20,7 +21,9 @@ export const config = {
 };
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  // Login + portao do CFO (owner/admin do tenant). Responde 401/403 sozinho.
+  const ctx = await authorize(req, res, { tenantRpc: 'r7_get_my_cfo_tenant_ids' });
+  if (!ctx) return;
 
   let pdfBase64, csvText, filename, platformHint;
   try {
@@ -35,6 +38,7 @@ export default async function handler(req, res) {
     filename,
     platformHint,
     apiKey: process.env.ANTHROPIC_API_KEY,
+    onUsage: (u) => meterUsage({ app: 'favo-cfo', tenantId: ctx.tenantId, userId: ctx.user.id, ...u }),
   });
 
   if (!parsed.ok) {

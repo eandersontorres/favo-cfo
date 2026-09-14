@@ -7,6 +7,10 @@
 // strict JSON out. Server normalizes numbers (strips commas / dollar signs)
 // and rebuilds derived totals so the client can trust the response shape.
 
+import { authorize, meterUsage } from './_lib/anthropicProxy.js'
+
+const MODEL = 'claude-opus-4-5'
+
 export const config = {
   api: {
     bodyParser: {
@@ -24,7 +28,9 @@ const num = (v) => {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+  // Login + portao do CFO (owner/admin do tenant). Responde 401/403 sozinho.
+  const ctx = await authorize(req, res, { tenantRpc: 'r7_get_my_cfo_tenant_ids' })
+  if (!ctx) return
 
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
   if (!ANTHROPIC_API_KEY) {
@@ -49,7 +55,7 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-5',
+        model: MODEL,
         max_tokens: 4096,
         messages: [{
           role: 'user',
@@ -126,6 +132,11 @@ Output only the JSON object.`
     } catch (e) {
       return res.status(502).json({ error: 'Invalid response from Anthropic', detail: rawBody.slice(0, 200) })
     }
+
+    await meterUsage({
+      app: 'favo-cfo', tenantId: ctx.tenantId, userId: ctx.user.id,
+      model: MODEL, messageId: apiData.id, usage: apiData.usage,
+    })
 
     const rawText = (apiData.content?.[0]?.text || '').trim()
     if (!rawText) {
