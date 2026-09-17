@@ -49,6 +49,10 @@
 //                    Square's processing cut, summed from tender-level
 //                    processing_fee_money on each order.
 //
+// An order counts as a SALE when it is COMPLETED, or when it is OPEN and
+// already carries a tender — Square Online never closes its orders, so
+// filtering on COMPLETED alone silently dropped that entire channel.
+//
 // All rows are idempotent (deterministic ids on `(prefix, date[, channel])`).
 // Re-running the sync overwrites prior values AND deletes sq_sale rows in the
 // window that the new run didn't regenerate (e.g. the legacy single
@@ -208,52 +212,76 @@ export default async function handler(req, res) {
       || findCat(c => c.tax_line === "Commissions and Fees" || /commission|fee/i.test(c.name || ""))
       || findCat(c => c.tax_line === "Other Expenses");
 
-    // ─── Page through orders ────────────────────────────────────────────
-    // /v2/orders/search lets us filter by closed_at (the moment the order
-    // was finalized — same anchor Square Sales Summary uses). We pull only
-    // COMPLETED orders so canceled drafts and abandoned carts don't leak in.
-    const allOrders = [];
-    let cursor;
-    let pages = 0;
-    do {
-      pages++;
-      if (pages > 50) break;
-      const body = {
-        location_ids: [locationId],
-        query: {
-          filter: {
-            date_time_filter: {
-              closed_at: { start_at: beginTime, end_at: endTime },
-            },
-            state_filter: {
-              states: ["COMPLETED"],
-            },
+    // ─── Page through orders — TWO passes ───────────────────────────────
+    // "Sale" is not the same as "state=COMPLETED".
+    //
+    // Pass 1 — COMPLETED, windowed on closed_at, the anchor Square's own
+    // Sales Summary uses.
+    //
+    // Pass 2 — OPEN orders that already carry a tender. Square Online never
+    // flips an order to COMPLETED: it sits OPEN with fulfillment PREPARED
+    // forever, even paid and delivered. Until 2026-09-17 this sync saw none
+    // of them, which hid $4,233 of August 2026 revenue and every cent the
+    // Square Online channel ever made — its category did not even exist.
+    // They have no closed_at, so a closed_at window cannot reach them; this
+    // pass windows on created_at, and Square refuses CLOSED_AT sorting for
+    // non-closed states anyway.
+    //
+    // CANCELED and DRAFT never count, tender or not: a canceled order with
+    // a tender is a refunded one.
+    const searchOrders = async (query) => {
+      const out = [];
+      let cursor;
+      for (let pages = 0; pages < 50; pages++) {
+        const body = { location_ids: [locationId], query, limit: 500 };
+        if (cursor) body.cursor = cursor;
+        const sqRes = await fetch(`${base}/v2/orders/search`, {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + token,
+            "Square-Version": SQUARE_VERSION,
+            "Content-Type": "application/json",
           },
-          sort: {
-            sort_field: "CLOSED_AT",
-            sort_order: "ASC",
-          },
-        },
-        limit: 500,
-      };
-      if (cursor) body.cursor = cursor;
-      const sqRes = await fetch(`${base}/v2/orders/search`, {
-        method: "POST",
-        headers: {
-          "Authorization": "Bearer " + token,
-          "Square-Version": SQUARE_VERSION,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-      if (!sqRes.ok) {
-        const err = await sqRes.text();
-        return res.status(502).json({ error: "Square Orders " + sqRes.status, detail: err.slice(0, 500) });
+          body: JSON.stringify(body),
+        });
+        if (!sqRes.ok) {
+          return { error: "Square Orders " + sqRes.status, detail: (await sqRes.text()).slice(0, 500) };
+        }
+        const data = await sqRes.json();
+        if (Array.isArray(data.orders)) out.push(...data.orders);
+        cursor = data.cursor;
+        if (!cursor) break;
       }
-      const data = await sqRes.json();
-      if (Array.isArray(data.orders)) allOrders.push(...data.orders);
-      cursor = data.cursor;
-    } while (cursor);
+      return { orders: out };
+    };
+
+    const completedPass = await searchOrders({
+      filter: {
+        date_time_filter: { closed_at: { start_at: beginTime, end_at: endTime } },
+        state_filter: { states: ["COMPLETED"] },
+      },
+      sort: { sort_field: "CLOSED_AT", sort_order: "ASC" },
+    });
+    if (completedPass.error) return res.status(502).json(completedPass);
+
+    const openPass = await searchOrders({
+      filter: {
+        date_time_filter: { created_at: { start_at: beginTime, end_at: endTime } },
+        state_filter: { states: ["OPEN"] },
+      },
+      sort: { sort_field: "CREATED_AT", sort_order: "ASC" },
+    });
+    if (openPass.error) return res.status(502).json(openPass);
+
+    const allOrders = completedPass.orders;
+    const seenIds = new Set(allOrders.map((o) => o.id));
+    let open_paid_orders = 0;
+    for (const o of openPass.orders) {
+      if (seenIds.has(o.id)) continue;
+      if (!(o.tenders || []).length) continue;
+      allOrders.push(o);
+      open_paid_orders++;
+    }
 
     // ─── Aggregate per local day ────────────────────────────────────────
     // Bucket by the restaurant's local day (America/Chicago for TorresBee),
@@ -342,9 +370,14 @@ export default async function handler(req, res) {
 
     const byDay = {};
     for (const order of allOrders) {
-      const closed = order.closed_at;
-      if (!closed) continue;
-      const date = new Date(closed).toLocaleDateString("en-CA", { timeZone: tenantTz });
+      // Sale date: closed_at when the order really closed, created_at for the
+      // paid-but-never-closed ones. An order that finally closes moves from one
+      // day to the other — harmless, because the daily cron recomputes the whole
+      // 90-day lookback and the stale sweep drops whatever it did not
+      // regenerate, so both days are rewritten in the same run.
+      const stamp = order.closed_at || order.created_at;
+      if (!stamp) continue;
+      const date = new Date(stamp).toLocaleDateString("en-CA", { timeZone: tenantTz });
       if (!byDay[date]) byDay[date] = { date, channels: {} };
       const channel = channelOf(order);
       if (!byDay[date].channels[channel]) byDay[date].channels[channel] = blankBucket();
@@ -674,6 +707,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       orders_scanned: allOrders.length,
+      open_paid_orders,
       days_with_sales: Object.keys(byDay).length,
       rows_written: rowsToWrite.length,
       stale_rows_deleted,
