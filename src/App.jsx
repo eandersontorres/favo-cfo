@@ -3839,7 +3839,7 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
                   source={sources.revenueSource}
                   sourceTag="Square"
                   bank={null}
-                  note="Source = sum of square_net_sales (items − discounts − returns), all channels — POS, online and aggregator gross. Service charges and auto-gratuity are NOT in here: they are passthrough and sit in Tips Payable as square_service_charges, so this figure runs below Square's dashboard Net sales by exactly that amount. Other drift = aggregator deposits still categorized as revenue (re-run Plaid sync / Sync Sales) or legacy rows still tagged square_sale_gross."
+                  note="Source = sum of square_net_sales (items − discounts − returns), all channels — POS, online and aggregator gross. Service charges and auto-gratuity are NOT in here: they are passthrough and sit in Tips Payable as square_service_charges, so this figure runs below Square's dashboard Net sales by exactly that amount. A known ~0.3% residual sits on top (Aug 2026: $322) — see docs/RECONCILIACAO_SQUARE.md before chasing it. Other drift = aggregator deposits still categorized as revenue (re-run Plaid sync / Sync Sales) or legacy rows still tagged square_sale_gross."
                   onAdjust={() => setAdjusting({
                     categoryHint: "Revenue - Dining",
                     suggestedDescription: `Revenue adjustment to match Square Sales Summary`,
