@@ -450,7 +450,7 @@ export default async function handler(req, res) {
               marketplace ? "Gross — settles via platform deposit (aggregator_settlement); tax remitted by platform" : null,
               c.discount_cents > 0 ? `Discounts: -$${(c.discount_cents / 100).toFixed(2)}` : null,
               c.return_cents > 0 ? `Returns: -$${(c.return_cents / 100).toFixed(2)}` : null,
-              c.svc_charge_cents > 0 ? `Service charges (passthrough, excluded): ${(c.svc_charge_cents / 100).toFixed(2)}` : null,
+              c.svc_charge_cents > 0 ? `Service charges (passthrough, excluded): $${(c.svc_charge_cents / 100).toFixed(2)}` : null,
             ].filter(Boolean).join(" · "),
             tags: ["channel:" + channel],
           });
@@ -511,7 +511,7 @@ export default async function handler(req, res) {
             reconciled: true,
             source: "square_service_charges",
             notes: ownAutoGratCents > 0
-              ? `Passthrough — excluded from Net Sales · Auto-grat: ${(ownAutoGratCents / 100).toFixed(2)}`
+              ? `Passthrough — excluded from Net Sales · Auto-grat: $${(ownAutoGratCents / 100).toFixed(2)}`
               : "Passthrough — excluded from Net Sales",
             tags: [],
           });
