@@ -96,6 +96,17 @@ const MERCHANT_RULES = [
   ["360TRAINING", "Training"],
   ["CINTAS", "Cintas"],
   ["PUBLIC STORAGE", "Rent & Utilities"],
+  // Texas WebFile manda TRES impostos diferentes com o mesmo descritor, e so o
+  // valor os distingue -- uma regra por merchant nao consegue separar:
+  //   Sales & Use Tax          cobrado do cliente  -> passivo
+  //   Mixed Beverage Sales 8,25%  cobrado do cliente  -> passivo
+  //   Mixed Beverage Gross Receipts 6,7%  incide sobre a casa -> DESPESA
+  // Os dois primeiros sao a esmagadora maioria do dinheiro (jul-set/2026:
+  // $23.452,98 contra $1.776,70), e ate 17/09/2026 os tres caiam em conta de
+  // despesa -- $23,4k de despesa fantasma em tres meses. O default vai pro
+  // passivo porque errar pra ca nao suja o P&L; a linha de 6,7% (a menor das
+  // tres do mes, razao 0,8121 contra a de 8,25%) e movida a mao pra despesa.
+  ["WEBFILE", "Sales Tax Payable"],
 ];
 
 // Network descriptors that name the payment RAIL, not the merchant. A pending
