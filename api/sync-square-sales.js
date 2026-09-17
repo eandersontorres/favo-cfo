@@ -9,7 +9,8 @@
 //   sq_sale_<date>_uber_eats      → Revenue - Uber Eats
 //   sq_sale_<date>_doordash       → Revenue - DoorDash
 //   sq_sale_<date>_grubhub        → Revenue - Grubhub
-//                    each = items + non-tip service charges − discounts − returns
+//                    each = items − discounts − returns. Service charges are
+//                    NOT revenue here — see sq_svc_ below.
 //                    Together they are Schedule C Line 1 (Gross Receipts).
 //                    Per-platform income categories are AUTO-CREATED (income,
 //                    tax_line='Gross Receipts') when missing, so each channel
@@ -31,8 +32,18 @@
 //                    surfaced in totals.marketplace_tax instead.
 //
 //   sq_tip_<date>   → Tips Payable (type='transfer')
-//                    Customer tips + auto-gratuity, own channels only (
-//                    marketplace tips never reach Square's tip field anyway).
+//                    Voluntary customer tips, own channels only (marketplace
+//                    tips never reach Square's tip field anyway).
+//
+//   sq_svc_<date>   → Tips Payable (type='transfer')
+//                    Mandatory service charges, auto-gratuity included. Own
+//                    channels only. Passthrough, NOT revenue: the restaurant
+//                    collects it and hands it to staff through payroll, so
+//                    booking it as income would pair a real wage expense with
+//                    phantom revenue. This is a deliberate divergence from
+//                    Square's Sales Summary "Net sales", which DOES count
+//                    service charges — to reconcile against the Square
+//                    dashboard, add totals.service_charges back.
 //
 //   sq_fee_<date>   → Square Fees (expense)
 //                    Square's processing cut, summed from tender-level
@@ -254,7 +265,7 @@ export default async function handler(req, res) {
     const blankBucket = () => ({
       orders: 0,
       items_cents: 0,
-      non_tip_sc_cents: 0,
+      svc_charge_cents: 0,
       auto_grat_cents: 0,
       tip_cents: 0,
       tax_cents: 0,
@@ -347,21 +358,21 @@ export default async function handler(req, res) {
         d.items_cents += cents(li.gross_sales_money);
       }
 
-      // Service charges. ALL of them count as revenue per Square's Sales
-      // Summary definition (which is what Anderson uses for the IRS Schedule
-      // C top line). Auto-gratuity is a *mandatory* service charge that the
-      // restaurant collects and then pays out to staff as part of payroll
-      // wages (it appears in the paystub's "Tips Charged" column — the
-      // restaurant is the entity of record, so it's revenue then expense,
-      // not passthrough). Voluntary tips are tracked separately on the
-      // order.tip_money field and DO go to Tips Payable.
+      // Service charges — passthrough, never revenue. Auto-gratuity is a
+      // *mandatory* charge the restaurant collects and hands to staff through
+      // payroll (it lands in the paystub's "Tips Charged" column), so booking
+      // it as income would pair a real wage expense with phantom revenue. It
+      // goes to Tips Payable next to the voluntary tips on order.tip_money.
       //
-      // We still track auto_grat separately so the response surfaces it for
-      // reconciliation against the paystub, but it lives in non_tip_sc_cents
-      // for the Net Sales math.
+      // amount_money is only populated for FIXED-amount charges — Square's
+      // reference calls it "the amount of a non-percentage-based service
+      // charge" and leaves it null whenever percentage is set. Auto-gratuity
+      // is percentage-based, so reading amount_money alone booked $0 for it:
+      // August 2026 landed $21.80 of the $3,656.79 Square actually reported.
+      // The computed figure lives in applied_money.
       for (const sc of order.service_charges || []) {
-        const amt = cents(sc.amount_money);
-        d.non_tip_sc_cents += amt;
+        const amt = sc.applied_money ? cents(sc.applied_money) : cents(sc.amount_money);
+        d.svc_charge_cents += amt;
         const isAutoGrat = sc.type === "AUTO_GRATUITY"
           || /auto.?grat|gratu/i.test(sc.name || "");
         if (isAutoGrat) d.auto_grat_cents += amt;
@@ -389,31 +400,35 @@ export default async function handler(req, res) {
     }
 
     // ─── Build ledger rows ──────────────────────────────────────────────
-    // Net Sales — matches Square Sales Summary's "Net sales" line exactly:
-    //   Items + ALL service charges (incl. auto-gratuity) − discounts − returns
-    // ...but split per channel so aggregator gross lands in Revenue -
-    // Delivery instead of inflating Dining. Auto-gratuity is restaurant
-    // revenue (then paid out via payroll, where it shows up as "Tips
-    // Charged" in the paystub). Voluntary tips on order.tip_money go to
-    // Tips Payable as passthrough.
+    // Net Sales = Items − discounts − returns, split per channel so aggregator
+    // gross lands in Revenue - <platform> instead of inflating Dining.
+    //
+    // Service charges are deliberately NOT in here. Square's Sales Summary
+    // "Net sales" does include them, so this figure sits below the Square
+    // dashboard by exactly totals.service_charges — that gap is the policy,
+    // not drift. Mandatory service charges and voluntary tips are both
+    // passthrough and land in Tips Payable (sq_svc_ / sq_tip_).
     const rowsToWrite = [];
     let skipped_tax = 0;
     let skipped_tip = 0;
+    let skipped_svc = 0;
     for (const day of Object.values(byDay)) {
       // Own-channel money (POS/online/invoices) is what Square collected on
       // the restaurant's behalf; marketplace money never touches Square's
       // rails, so its tax/tips must not become Square-side liabilities.
       let ownTaxCents = 0;
       let ownTipCents = 0;
+      let ownSvcCents = 0;
       let ownAutoGratCents = 0;
       let feeCents = 0;
 
       for (const [channel, c] of Object.entries(day.channels)) {
-        const netSalesCents = c.items_cents + c.non_tip_sc_cents - c.discount_cents - c.return_cents;
+        const netSalesCents = c.items_cents - c.discount_cents - c.return_cents;
         const marketplace = MARKETPLACE_CHANNELS.has(channel);
         if (!marketplace) {
           ownTaxCents += c.tax_cents;
           ownTipCents += c.tip_cents;
+          ownSvcCents += c.svc_charge_cents;
           ownAutoGratCents += c.auto_grat_cents;
         }
         feeCents += c.fee_cents;   // fallback: only ever non-zero if Square starts populating tenders
@@ -435,7 +450,7 @@ export default async function handler(req, res) {
               marketplace ? "Gross — settles via platform deposit (aggregator_settlement); tax remitted by platform" : null,
               c.discount_cents > 0 ? `Discounts: -$${(c.discount_cents / 100).toFixed(2)}` : null,
               c.return_cents > 0 ? `Returns: -$${(c.return_cents / 100).toFixed(2)}` : null,
-              c.non_tip_sc_cents > 0 ? `Service charges (non-tip): $${(c.non_tip_sc_cents / 100).toFixed(2)}` : null,
+              c.svc_charge_cents > 0 ? `Service charges (passthrough, excluded): ${(c.svc_charge_cents / 100).toFixed(2)}` : null,
             ].filter(Boolean).join(" · "),
             tags: ["channel:" + channel],
           });
@@ -467,19 +482,41 @@ export default async function handler(req, res) {
             id: `sq_tip_${day.date}`,
             tenant_id,
             date: day.date,
-            description: "SQUARE TIPS + AUTO-GRATUITY",
+            description: "SQUARE TIPS",
             amount: Math.round(ownTipCents) / 100,
             category_id: tipsCatId,
             account: "Square POS",
             reconciled: true,
             source: "square_tips",
-            notes: ownAutoGratCents > 0
-              ? `Tips: $${(ownTipCents / 100).toFixed(2)} · Auto-grat: $${(ownAutoGratCents / 100).toFixed(2)}`
-              : "",
+            notes: "Voluntary tips — passthrough, paid out to staff",
             tags: [],
           });
         } else {
           skipped_tip++;
+        }
+      }
+      // Mandatory service charges (auto-gratuity and friends). Same Tips
+      // Payable account as the voluntary tips, but its own row so the
+      // paystub's "Tips Charged" column reconciles against it directly.
+      if (ownSvcCents > 0) {
+        if (tipsCatId) {
+          rowsToWrite.push({
+            id: `sq_svc_${day.date}`,
+            tenant_id,
+            date: day.date,
+            description: "SQUARE SERVICE CHARGES + AUTO-GRATUITY",
+            amount: Math.round(ownSvcCents) / 100,
+            category_id: tipsCatId,
+            account: "Square POS",
+            reconciled: true,
+            source: "square_service_charges",
+            notes: ownAutoGratCents > 0
+              ? `Passthrough — excluded from Net Sales · Auto-grat: ${(ownAutoGratCents / 100).toFixed(2)}`
+              : "Passthrough — excluded from Net Sales",
+            tags: [],
+          });
+        } else {
+          skipped_svc++;
         }
       }
       // Payments API is the real source; the tender sum stays as a fallback in
@@ -549,7 +586,7 @@ export default async function handler(req, res) {
       .from("r7_ledger_transactions")
       .select("id")
       .eq("tenant_id", tenant_id)
-      .in("source", ["square_net_sales", "square_sale_gross"])
+      .in("source", ["square_net_sales", "square_sale_gross", "square_service_charges"])
       .gte("date", beginDate)
       .lte("date", endDate);
     const staleIds = (existingSaleRows || []).map(r => r.id).filter(id => !expectedIds.has(id));
@@ -581,6 +618,7 @@ export default async function handler(req, res) {
       "square_sale_gross", // legacy rows from before the source rename
       "square_sales_tax",
       "square_tips",
+      "square_service_charges",
       "square_fee",
       "square_settlement",
       "aggregator_settlement",
@@ -608,7 +646,8 @@ export default async function handler(req, res) {
     const mktOnly = (pick) => Math.round(allBuckets.reduce((s, [ch, c]) => s + (MARKETPLACE_CHANNELS.has(ch) ? pick(c) : 0), 0)) / 100;
     const totals = {
       items: sumCents(c => c.items_cents),
-      non_tip_service_charges: sumCents(c => c.non_tip_sc_cents),
+      service_charges: ownOnly(c => c.svc_charge_cents),
+      marketplace_service_charges: mktOnly(c => c.svc_charge_cents),
       auto_gratuity: ownOnly(c => c.auto_grat_cents),
       tips: ownOnly(c => c.tip_cents),
       tax: ownOnly(c => c.tax_cents),
@@ -622,13 +661,13 @@ export default async function handler(req, res) {
       processing_fees_error: feeByDay.__error || null,
       cash_tendered: Object.values(cashByDay).reduce((s2, c) => s2 + c.cents, 0),
       cash_error: cashError,
-      net_sales: sumCents(c => c.items_cents + c.non_tip_sc_cents - c.discount_cents - c.return_cents),
+      net_sales: sumCents(c => c.items_cents - c.discount_cents - c.return_cents),
     };
     const by_channel = {};
     for (const [ch, c] of allBuckets) {
       if (!by_channel[ch]) by_channel[ch] = { orders: 0, net_sales: 0 };
       by_channel[ch].orders += c.orders;
-      by_channel[ch].net_sales += Math.round(c.items_cents + c.non_tip_sc_cents - c.discount_cents - c.return_cents) / 100;
+      by_channel[ch].net_sales += Math.round(c.items_cents - c.discount_cents - c.return_cents) / 100;
     }
     for (const ch of Object.keys(by_channel)) by_channel[ch].net_sales = Math.round(by_channel[ch].net_sales * 100) / 100;
     totals.by_channel = by_channel;
@@ -646,6 +685,7 @@ export default async function handler(req, res) {
       fees_category_resolved: !!feesCatId,
       skipped_tax,
       skipped_tip,
+      skipped_svc,
       totals,
       window: { start: beginDate, end: endDate },
     });
