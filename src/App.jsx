@@ -1151,7 +1151,7 @@ function SalesSyncButton({ tenantId, dateRange, onSync, showToast }) {
             .join(" · ") + ")"
         : "";
       const headline = t.net_sales != null
-        ? `${result.days_with_sales} days · net ${fmt(t.net_sales)}${channelNote} · tax ${fmt(t.tax || 0)} · tips ${fmt((t.tips || 0) + (t.auto_gratuity || 0))} · fees ${fmt(t.processing_fees || 0)}`
+        ? `${result.days_with_sales} days · net ${fmt(t.net_sales)}${channelNote} · tax ${fmt(t.tax || 0)} · tips ${fmt(t.tips || 0)} · svc ${fmt(t.service_charges || 0)} · fees ${fmt(t.processing_fees || 0)}`
         : `${result.days_with_sales} days · gross ${fmt(t.gross_sales || 0)} · fees ${fmt(t.processing_fees || 0)}`;
       const settlementNote = result.settlements_retagged > 0
         ? ` · ${result.settlements_retagged} bank deposit${result.settlements_retagged === 1 ? "" : "s"} marked as settlement`
@@ -3840,7 +3840,7 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
                   source={sources.revenueSource}
                   sourceTag="Square"
                   bank={null}
-                  note="Source = sum of square_net_sales (items + non-tip service charges − discounts − returns), all channels — POS, online and aggregator gross. Drift typically = aggregator deposits still categorized as revenue (re-run Plaid sync / Sync Sales) or legacy rows still tagged square_sale_gross."
+                  note="Source = sum of square_net_sales (items − discounts − returns), all channels — POS, online and aggregator gross. Service charges and auto-gratuity are NOT in here: they are passthrough and sit in Tips Payable as square_service_charges, so this figure runs below Square's dashboard Net sales by exactly that amount. Other drift = aggregator deposits still categorized as revenue (re-run Plaid sync / Sync Sales) or legacy rows still tagged square_sale_gross."
                   onAdjust={() => setAdjusting({
                     categoryHint: "Revenue - Dining",
                     suggestedDescription: `Revenue adjustment to match Square Sales Summary`,
