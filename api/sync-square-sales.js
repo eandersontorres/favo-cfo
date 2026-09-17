@@ -485,7 +485,12 @@ export default async function handler(req, res) {
               c.return_cents > 0 ? `Returns: -$${(c.return_cents / 100).toFixed(2)}` : null,
               c.svc_charge_cents > 0 ? `Service charges (passthrough, excluded): $${(c.svc_charge_cents / 100).toFixed(2)}` : null,
             ].filter(Boolean).join(" · "),
-            tags: ["channel:" + channel],
+            // orders:N deixa a CONTAGEM sair da mesma fonte que o dinheiro.
+            // O CEO contava em pos_orders, o espelho do KDS — que tem 541
+            // pedidos com closed_at reescrito pelo sweep de 07/09, jogando
+            // vendas de mai-set dentro de um dia so. Setembro aparecia com
+            // 1.623 pedidos em 17 dias e ticket medio de $31,50.
+            tags: ["channel:" + channel, "orders:" + c.orders],
           });
         }
       }
