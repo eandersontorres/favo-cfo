@@ -54,13 +54,34 @@ export async function signOutUser() {
 }
 
 // ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
+// PostgREST devolve no maximo 1000 linhas por resposta, entao uma consulta sem
+// paginacao NAO devolve erro -- devolve menos dado, calada. Como a ordem e por
+// data decrescente, o que sumia era o comeco do periodo: em 2026, com 4.290
+// linhas, "este ano" parava em 04/ago e janeiro a julho simplesmente nao
+// existiam pra tela nenhuma (P&L, Dashboard, Cash Flow, todas).
+//
+// O desempate por id importa: centenas de linhas dividem a mesma data, e sem
+// uma segunda chave a ordem entre elas nao e estavel entre requisicoes -- as
+// paginas se sobrepoem e perdem linha no meio.
+const TXN_PAGE = 1000
+const TXN_MAX_PAGES = 100
+
 export async function fetchTransactions(tenantId, { start, end } = {}) {
-  let q = supabase.from('r7_ledger_transactions').select('*').eq('tenant_id', tenantId).order('date', { ascending: false })
-  if (start) q = q.gte('date', start)
-  if (end)   q = q.lte('date', end)
-  const { data, error } = await q
-  if (error) { console.error('fetchTransactions', error); return [] }
-  return data
+  const out = []
+  for (let page = 0; page < TXN_MAX_PAGES; page++) {
+    let q = supabase.from('r7_ledger_transactions').select('*').eq('tenant_id', tenantId)
+      .order('date', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page * TXN_PAGE, page * TXN_PAGE + TXN_PAGE - 1)
+    if (start) q = q.gte('date', start)
+    if (end)   q = q.lte('date', end)
+    const { data, error } = await q
+    if (error) { console.error('fetchTransactions', error); return out }
+    out.push(...data)
+    if (data.length < TXN_PAGE) return out
+  }
+  console.warn('fetchTransactions: parou em', TXN_MAX_PAGES * TXN_PAGE, 'linhas')
+  return out
 }
 
 export async function upsertTransactions(rows, tenantId) {
