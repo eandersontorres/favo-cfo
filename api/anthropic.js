@@ -1,27 +1,14 @@
-// api/anthropic.js — same pattern as Favo Kitchen
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-  if (req.method === 'OPTIONS') return res.status(200).end()
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+// api/anthropic.js — proxy autenticado pro Anthropic (sem chamadas no src hoje;
+// o parse de PDF usa /api/parse-statement e /api/parse-paystub). Toda a logica
+// (JWT, tenant, CORS, whitelist, metering) fica em _lib/anthropicProxy.js.
 
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' })
+import { createAnthropicProxy } from './_lib/anthropicProxy.js'
 
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(req.body),
-    })
-    const data = await response.json()
-    return res.status(response.status).json(data)
-  } catch (err) {
-    return res.status(500).json({ error: err.message })
-  }
-}
+export default createAnthropicProxy({
+  app: 'favo-cfo',
+  models: ['claude-opus-4-5'],
+  maxTokensCap: 8192,
+  origins: ['https://cfo.favo.team', 'https://cfo.clariva.cloud'],
+  // Portao do CFO: owner/admin (ceo_admins) ou super admin — nao r7_user_tenants.
+  tenantRpc: 'r7_get_my_cfo_tenant_ids',
+})

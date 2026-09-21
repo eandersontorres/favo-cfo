@@ -788,12 +788,24 @@ export async function upsertAggregatorPayouts(rows, tenantId) {
   return { ok: true, saved: (data || []).length }
 }
 
+// Headers pros endpoints de IA (/api/parse-*): JWT do usuario + tenant ativo.
+// O servidor valida os dois contra o portao do CFO (r7_get_my_cfo_tenant_ids).
+export async function aiAuthHeaders() {
+  const { data } = await supabase.auth.getSession()
+  const token = data?.session?.access_token
+  if (!token) throw new Error('Session expired — please sign in again')
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+  const tid = TENANT()
+  if (tid && tid !== 'demo') headers['X-Tenant-Id'] = tid
+  return headers
+}
+
 // Parse a delivery aggregator statement (PDF/CSV) via the Anthropic-backed
 // endpoint. Returns the normalized envelope; caller persists what it wants.
 export async function parseAggregatorStatement({ pdfBase64, csvText, filename, platformHint }) {
   const res = await fetch('/api/parse-aggregator-statement', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await aiAuthHeaders(),
     body: JSON.stringify({ pdfBase64, csvText, filename, platformHint }),
   })
   if (!res.ok) {

@@ -17,3 +17,8 @@ infra/worker/.wrangler/
 # oficial do repo, tirar daqui em vez de commitar por cima.
 auth.jpg
 clariva_bank_revenue_model.xlsx
+
+# Extratos do banco: entram aqui pra auditoria e nunca saem daqui.
+statement/
+
+.vercel
