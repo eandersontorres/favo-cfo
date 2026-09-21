@@ -4076,61 +4076,310 @@ function SourceRow({ label, ledger, source, sourceTag, bank, note, onAdjust }) {
 }
 
 // ─── CASH FLOW ────────────────────────────────────────────────────────────────
-function CashFlow({ transactions, categories, recurring = [], dateRange = {} }) {
-  const isLedger = makeLedgerFilter(categories, transactions);
-  const operating = transactions.filter(t => ["1","2","3","4","6","7","8","9"].includes(t.category) && isLedger(t));
-  const opInflow = operating.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-  const opOutflow = Math.abs(operating.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0));
-  const netOperating = opInflow - opOutflow;
-  const netInvesting = -234.80; // equipment sample
-  const netFinancing = 0;
-  const netChange = netOperating + netInvesting + netFinancing;
-  const beginBalance = 12400.00;
-  const endBalance = beginBalance + netChange;
+// Regime de caixa, não de competência. A P&L conta o que foi ganho no período;
+// esta tela conta só o que passou pela conta bancária. As duas divergirem é o
+// comportamento correto, não um bug.
+//
+// Entra aqui: linha com account_id de uma conta líquida (checking/savings/cash).
+// É por isso que square_settlement e aggregator_settlement CONTAM aqui e não
+// contam na P&L — lá a receita já veio do POS (square_net_sales); aqui o
+// depósito é o dinheiro de verdade. Pelo mesmo motivo square_net_sales,
+// kitchen_purchase e os accruals ficam de fora: nunca tocaram a conta.
+//
+// Cartão de crédito não é caixa. A compra no cartão não aparece nesta tela; o
+// pagamento da fatura aparece, em Financing.
+//
+// Transferência entre duas contas líquidas se anula: as duas pernas estão no
+// conjunto. Tiramos o par pra não inflar entrada e saída brutas.
+//
+// Mês importado como resumo (source='pl_import') não tem conta bancária. Entra
+// num modo separado que mostra movimento mas NÃO mostra saldo — resumo mensal
+// não reconstrói saldo, e fingir que reconstrói é pior do que não mostrar.
+
+// Classificação por NOME da categoria, não por tax_line: Equipment e
+// Depreciation compartilham a tax_line "Depreciation" e só um dos dois é caixa.
+const CASHFLOW_TRANSFER  = /^(internal transfer|transfer(ê|e)ncia)/i;
+const CASHFLOW_FINANCING = /^(loan|empr(é|e)stimo|financiamento)/i;
+const CASHFLOW_INVESTING = /^(equipment|leasehold|improvement|buildout|capex|vehicle|obra)/i;
+const CASHFLOW_NON_CASH  = /^(deprecia|amortiza)/i;
+
+// Usados só no modo sem contas cadastradas (ver isCashRow).
+const CASHFLOW_CARDISH = /credit|card|cart(ã|a)o|visa|mastercard|amex/i;
+const CASHFLOW_NON_BANK_SOURCES = new Set([
+  "square_net_sales", "square_sales_tax", "square_tips", "square_fee", "square_service_charges",
+  "kitchen_purchase", "kitchen_split_retro", "aggregator_accrual", "pl_import",
+]);
+
+function cashflowSection(catName) {
+  const n = (catName || "").trim();
+  if (CASHFLOW_NON_CASH.test(n)) return null;          // nunca foi caixa
+  if (CASHFLOW_TRANSFER.test(n)) return "transfer";
+  if (CASHFLOW_FINANCING.test(n)) return "financing";
+  if (CASHFLOW_INVESTING.test(n)) return "investing";
+  return "operating";
+}
+
+function CashFlow({ transactions, allTransactions, categories, bankAccounts = [], recurring = [], dateRange = {} }) {
+  const all = allTransactions || transactions;
+
+  // ── Quem é caixa ────────────────────────────────────────────────────────────
+  const accounts = (bankAccounts || []).filter(a => a.status === "active");
+  const accById = new Map(accounts.map(a => [a.id, a]));
+  const cashAccounts = accounts.filter(a => ACCOUNT_TYPE_META[a.type]?.liquid);
+  const debtAccounts = accounts.filter(a => ACCOUNT_TYPE_META[a.type]?.liability);
+  const cashIds = new Set(cashAccounts.map(a => a.id));
+
+  // Com contas cadastradas o account_id decide, e ponto. Sem nenhuma conta
+  // cadastrada (import CSV/OFX cru, demo) o único sinal é a string da conta:
+  // reconhecemos cartão pelo nome e tratamos o resto como caixa, ignorando as
+  // origens que nunca tocam banco. É pior do que ter a conta cadastrada — e a
+  // tela diz isso, porque sem conta cadastrada também não há saldo.
+  const linked = accounts.length > 0;
+  const isCashRow = linked
+    ? (t => !!t.account_id && cashIds.has(t.account_id))
+    : (t => !!t.account && !CASHFLOW_NON_BANK_SOURCES.has(t.source) && !CASHFLOW_CARDISH.test(t.account));
+
+  // Pai de split é só o registro de auditoria da linha do banco; os filhos
+  // carregam a classificação e somam exatamente o mesmo valor.
+  const splitParents = new Set();
+  for (const t of all) if (t.parent_id) splitParents.add(t.parent_id);
+  const usable = t => !splitParents.has(t.id);
+
+  const catById = new Map((categories || []).map(c => [c.id, c]));
+  const nameOf = t => catById.get(t.category)?.name || "Uncategorized";
+
+  // ── Contraparte de cada transferência ───────────────────────────────────────
+  // detectTransferPairs marca toda linha source='internal_transfer' como
+  // transferência mas nunca resolve a contraparte dela (entra em `pairs` com
+  // null antes do loop de pareamento, que então a pula). Aqui a contraparte é
+  // justamente o que decide se o dinheiro saiu do caixa — pagamento de fatura —
+  // ou só mudou de conta — Main → Sales Tax. Então pareamos aqui, com posse:
+  // cada perna só pode ser reivindicada por um par, e empate por valor se
+  // resolve pela data mais próxima.
+  const isTransferLeg = t => t.source === "internal_transfer" || CASHFLOW_TRANSFER.test(nameOf(t));
+  const partnerById = new Map();
+  {
+    const legs = all.filter(t => usable(t) && isTransferLeg(t));
+    const byAmount = new Map();
+    for (const t of legs) {
+      const k = Math.abs(parseFloat(t.amount) || 0).toFixed(2);
+      if (!byAmount.has(k)) byAmount.set(k, []);
+      byAmount.get(k).push(t);
+    }
+    const taken = new Set();
+    const gap = (a, b) => Math.abs(new Date(a.date) - new Date(b.date));
+    for (const t of [...legs].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))) {
+      if (taken.has(t.id)) continue;
+      const amt = parseFloat(t.amount) || 0;
+      if (!amt) continue;
+      const match = (byAmount.get(Math.abs(amt).toFixed(2)) || [])
+        .filter(o => o.id !== t.id && !taken.has(o.id)
+          && (parseFloat(o.amount) || 0) * amt < 0
+          && accountKeyOf(o) !== accountKeyOf(t)
+          && gap(o, t) <= 3 * 86400000)
+        .sort((x, y) => gap(x, t) - gap(y, t))[0];
+      if (!match) continue;
+      taken.add(t.id); taken.add(match.id);
+      partnerById.set(t.id, match); partnerById.set(match.id, t);
+    }
+  }
+
+  // ── Classificação de uma linha ──────────────────────────────────────────────
+  // null = não entra no demonstrativo (não-caixa, ou transferência que se anula
+  // dentro do próprio caixa).
+  const classify = (t) => {
+    const sec = cashflowSection(nameOf(t));
+    if (sec === null) return null;
+
+    if (sec === "transfer" || t.source === "internal_transfer") {
+      const partner = partnerById.get(t.id) || null;
+      if (partner && isCashRow(partner)) return null;      // as duas pernas estão aqui
+      const acc = partner ? accById.get(partner.account_id) : null;
+      if (acc && ACCOUNT_TYPE_META[acc.type]?.liability) {
+        return { section: "financing", label: acc.type === "loan" ? "Loan payments" : "Credit card payments" };
+      }
+      // Perna do outro lado não identificada. Vira financing porque saiu do
+      // caixa operacional pra pagar algo que não é despesa do período — mas fica
+      // numa linha própria, porque "não sei pra onde foi" não é um destino.
+      return { section: "financing", label: "Transfers out — destination not matched" };
+    }
+    return { section: sec, label: nameOf(t) };
+  };
+
+  // ── Linhas do período ───────────────────────────────────────────────────────
+  const inRange = (transactions || []).filter(usable);
+  const cashRows = inRange.filter(isCashRow);
+  // Um mês pode carregar as duas bases: o resumo mensal da planilha e, depois,
+  // o extrato do banco importado por cima — jan e fev/26 do piloto são assim.
+  // Somar os dois conta o mês duas vezes. Onde há extrato, o extrato manda: é a
+  // base mais fina e é ela que fecha com o saldo da conta.
+  const bankMonths = new Set(cashRows.map(t => (t.date || "").slice(0, 7)));
+  const summaryRows = inRange.filter(t => t.source === "pl_import" && !bankMonths.has((t.date || "").slice(0, 7)));
+  const mode = cashRows.length === 0 && summaryRows.length > 0 ? "summary"
+             : cashRows.length > 0 && summaryRows.length > 0 ? "mixed" : "bank";
+  const stmtRows = [...cashRows, ...summaryRows];
+
+  const sectionTotals = { operating: 0, investing: 0, financing: 0 };
+  const itemsBySection = { operating: new Map(), investing: new Map(), financing: new Map() };
+  let inflow = 0, outflow = 0;
+  for (const t of stmtRows) {
+    const c = classify(t);
+    if (!c) continue;
+    const amt = parseFloat(t.amount) || 0;
+    sectionTotals[c.section] += amt;
+    const m = itemsBySection[c.section];
+    m.set(c.label, (m.get(c.label) || 0) + amt);
+    if (amt > 0) inflow += amt; else outflow += amt;
+  }
+  const netChange = sectionTotals.operating + sectionTotals.investing + sectionTotals.financing;
+
+  // ── Saldo ───────────────────────────────────────────────────────────────────
+  // Saldo é ponto no tempo, não soma de janela. Cada conta traz o saldo vivo em
+  // opening_balance (o Plaid regrava a cada sync) com a data em opening_date;
+  // daí rolamos pra frente com as linhas posteriores à âncora.
+  //
+  // Só dá pra rolar quando o período alcança a data da âncora: as linhas entre
+  // o fim do período e a âncora não estão carregadas (fetchTransactions busca
+  // pelo dateRange ativo). Fora disso mostramos movimento e calamos sobre saldo.
+  const allCash = all.filter(t => usable(t) && isCashRow(t));
+  const anchorDate = cashAccounts.reduce((mx, a) => (a.opening_date && a.opening_date > mx ? a.opening_date : mx), "0000-01-01");
+  // Três motivos distintos pra não haver saldo — a tela diz qual deles é.
+  // "mixed" entra aqui porque o resumo mensal move o net do período sem tocar
+  // conta nenhuma: o saldo final continuaria certo, mas o inicial e a coluna
+  // mês a mês sairiam do nada. Atravessar troca de base não reconstrói saldo.
+  const rollBlockedBy = cashAccounts.length === 0 ? "no_accounts"
+                      : mode !== "bank" ? "mixed_basis"
+                      : (!dateRange.end || dateRange.end < anchorDate) ? "before_anchor"
+                      : null;
+  const canRoll = rollBlockedBy === null;
+
+  // Saldo de uma conta numa data = âncora + o que entrou depois dela, até asOf.
+  // Vale pro Plaid (âncora = saldo vivo) e pra conta manual (âncora = abertura).
+  const usableAll = all.filter(usable);
+  const rollBalance = (a, asOf) => {
+    const from = a.opening_date || "0000-01-01";
+    return (parseFloat(a.opening_balance) || 0) + usableAll
+      .filter(t => t.account_id === a.id && t.date > from && t.date <= asOf)
+      .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  };
+  const balanceAt = asOf => cashAccounts.reduce((s, a) => s + rollBalance(a, asOf), 0);
+
+  const endBalance = canRoll ? balanceAt(dateRange.end) : null;
+  const beginBalance = canRoll ? endBalance - netChange : null;
+  const cardDebt = debtAccounts.reduce((s, a) => s + rollBalance(a, dateRange.end || "9999-12-31"), 0);
+
+  // ── Frescor do sync ─────────────────────────────────────────────────────────
+  const today = new Date().toISOString().slice(0, 10);
+  const lastCashDate = allCash.reduce((mx, t) => (t.date > mx ? t.date : mx), "");
+  const staleDays = lastCashDate ? Math.round((new Date(today) - new Date(lastCashDate)) / 86400000) : null;
+
+  // ── Mês a mês ───────────────────────────────────────────────────────────────
+  const monthly = (() => {
+    const by = new Map();
+    for (const t of stmtRows) {
+      const c = classify(t);
+      if (!c) continue;
+      const k = (t.date || "").slice(0, 7);
+      if (!k) continue;
+      if (!by.has(k)) by.set(k, { key: k, inflow: 0, outflow: 0, net: 0 });
+      const row = by.get(k);
+      const amt = parseFloat(t.amount) || 0;
+      row.net += amt;
+      if (amt > 0) row.inflow += amt; else row.outflow += amt;
+    }
+    const rows = [...by.values()].sort((a, b) => a.key.localeCompare(b.key));
+    if (canRoll) {
+      // Fecha pelo fim e volta: o saldo conhecido é o do fim do período.
+      let running = endBalance;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        rows[i].balance = running;
+        running -= rows[i].net;
+      }
+    }
+    return rows;
+  })();
 
   const sections = [
-    { label: "Operating Activities", items: [
-      { name: "Cash from customers", value: opInflow },
-      { name: "Payments to suppliers", value: -transactions.filter(t=>t.category==="1").reduce((s,t)=>s+t.amount,0) },
-      { name: "Payroll & wages", value: -Math.abs(transactions.filter(t=>t.category==="2").reduce((s,t)=>s+t.amount,0)) },
-      { name: "Rent & utilities", value: -Math.abs(transactions.filter(t=>t.category==="3").reduce((s,t)=>s+t.amount,0)) },
-      { name: "Other operating", value: -Math.abs(transactions.filter(t=>["4","6","7"].includes(t.category)).reduce((s,t)=>s+t.amount,0)) },
-    ], net: netOperating, color: "var(--accent)" },
-    { label: "Investing Activities", items: [
-      { name: "Equipment purchases", value: netInvesting },
-    ], net: netInvesting, color: "var(--blue)" },
-    { label: "Financing Activities", items: [
-      { name: "No financing activity", value: 0 },
-    ], net: netFinancing, color: "var(--purple)" },
+    { key: "operating", label: "Operating Activities", color: "var(--accent)" },
+    { key: "investing", label: "Investing Activities", color: "var(--blue)" },
+    { key: "financing", label: "Financing Activities", color: "var(--purple)" },
   ];
+
+  const rangeDays = (dateRange.start && dateRange.end)
+    ? Math.max(1, Math.round((new Date(dateRange.end) - new Date(dateRange.start)) / 86400000) + 1)
+    : 30;
+  const outflowPerDay = Math.abs(outflow) / rangeDays;
+  const netBurnPerDay = netChange < 0 ? Math.abs(netChange) / rangeDays : 0;
 
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <div className="page-title">Cash Flow Statement</div>
-          <div className="page-subtitle">{dateRange.start} → {dateRange.end} · Direct Method</div>
+          <div className="page-subtitle">
+            {dateRange.start} → {dateRange.end} · Direct method ·{" "}
+            {mode === "summary" ? "monthly summary rows (no bank detail)"
+              : mode === "mixed" ? "bank rows + monthly summary rows"
+              : cashAccounts.length + " cash account" + (cashAccounts.length === 1 ? "" : "s")}
+          </div>
         </div>
         <button className="btn btn-outline btn-sm"><Icon name="download" size={13} /> Export</button>
       </div>
 
+      {/* O que esta tela não sabe, dito antes dos números e não depois. */}
+      {(mode !== "bank" || !canRoll || (staleDays !== null && staleDays > 3)) && (
+        <div className="card" style={{ marginBottom: 14, borderLeft: "3px solid var(--yellow)" }}>
+          {mode === "summary" && (
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6 }}>
+              Este período só tem resumo mensal importado, sem extrato bancário. Dá pra ver movimento; <strong>não dá pra ver saldo</strong>.
+            </div>
+          )}
+          {mode === "mixed" && (
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6 }}>
+              O período mistura extrato bancário com resumo mensal importado — mês que tem extrato usa só o extrato, nunca os dois. Os totais somam as duas bases e por isso o <strong>saldo fica omitido</strong>.
+            </div>
+          )}
+          {rollBlockedBy === "no_accounts" && (
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6 }}>
+              Nenhuma conta corrente cadastrada em <strong>Bank Accounts</strong>. Sem conta não há saldo — o movimento abaixo saiu do nome da conta em cada linha, que é um palpite.
+            </div>
+          )}
+          {rollBlockedBy === "before_anchor" && (
+            <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 6 }}>
+              Saldo omitido: o período termina antes de <span className="mono">{anchorDate}</span>, data do último saldo bancário conhecido, e as linhas entre as duas datas não estão carregadas. Estenda o período até hoje pra ver saldo.
+            </div>
+          )}
+          {staleDays !== null && staleDays > 3 && (
+            <div style={{ fontSize: 12, color: "var(--text2)" }}>
+              Última linha bancária em <span className="mono">{lastCashDate}</span> — {staleDays} dias atrás. Rode <strong>Sync Bank</strong> antes de tratar o saldo final como o de hoje.
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="grid-2">
         <div>
-          {sections.map(s => (
-            <div key={s.label} className="card" style={{ marginBottom: 14 }}>
-              <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 14, color: s.color }}>{s.label}</div>
-              {s.items.map(item => (
-                <div key={item.name} className="flex items-center justify-between" style={{ padding: "7px 0", borderBottom: "1px solid var(--border)" }}>
-                  <span style={{ fontSize: 13, color: "var(--text2)" }}>{item.name}</span>
-                  <span className="mono" style={{ color: item.value >= 0 ? "var(--accent)" : "var(--red)", fontSize: 13 }}>{fmt(item.value)}</span>
+          {sections.map(s => {
+            const items = [...itemsBySection[s.key].entries()].sort((a, b) => b[1] - a[1]);
+            return (
+              <div key={s.key} className="card" style={{ marginBottom: 14 }}>
+                <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 14, color: s.color }}>{s.label}</div>
+                {items.length === 0 && (
+                  <div style={{ fontSize: 12, color: "var(--text3)", padding: "7px 0" }}>Sem movimento no período</div>
+                )}
+                {items.map(([label, value]) => (
+                  <div key={label} className="flex items-center justify-between" style={{ padding: "7px 0", borderBottom: "1px solid var(--border)" }}>
+                    <span style={{ fontSize: 13, color: "var(--text2)" }}>{label}</span>
+                    <span className="mono" style={{ color: value >= 0 ? "var(--accent)" : "var(--red)", fontSize: 13 }}>{fmt(value)}</span>
+                  </div>
+                ))}
+                <div className="flex items-center justify-between" style={{ marginTop: 10, paddingTop: 10 }}>
+                  <span style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Net {s.label.split(" ")[0]}</span>
+                  <span className="mono" style={{ color: sectionTotals[s.key] >= 0 ? "var(--accent)" : "var(--red)", fontWeight: 600, fontSize: 14 }}>{fmt(sectionTotals[s.key])}</span>
                 </div>
-              ))}
-              <div className="flex items-center justify-between" style={{ marginTop: 10, paddingTop: 10 }}>
-                <span style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Net {s.label.split(" ")[0]}</span>
-                <span className="mono" style={{ color: s.net >= 0 ? "var(--accent)" : "var(--red)", fontWeight: 600, fontSize: 14 }}>{fmt(s.net)}</span>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <div>
@@ -4138,29 +4387,62 @@ function CashFlow({ transactions, categories, recurring = [], dateRange = {} }) 
             <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 16 }}>Cash Summary</div>
             {[
               { label: "Beginning Cash Balance", value: beginBalance, color: "var(--text)" },
-              { label: "Net Operating Cash", value: netOperating, color: netOperating >= 0 ? "var(--accent)" : "var(--red)" },
-              { label: "Net Investing Cash", value: netInvesting, color: netInvesting >= 0 ? "var(--accent)" : "var(--red)" },
-              { label: "Net Financing Cash", value: netFinancing, color: "var(--text2)" },
+              { label: "Net Operating Cash", value: sectionTotals.operating, color: sectionTotals.operating >= 0 ? "var(--accent)" : "var(--red)" },
+              { label: "Net Investing Cash", value: sectionTotals.investing, color: sectionTotals.investing >= 0 ? "var(--accent)" : "var(--red)" },
+              { label: "Net Financing Cash", value: sectionTotals.financing, color: sectionTotals.financing >= 0 ? "var(--accent)" : "var(--red)" },
               { label: "Net Change in Cash", value: netChange, color: netChange >= 0 ? "var(--accent)" : "var(--red)" },
             ].map(r => (
               <div key={r.label} className="flex items-center justify-between" style={{ padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
                 <span style={{ fontSize: 13, color: "var(--text2)" }}>{r.label}</span>
-                <span className="mono" style={{ color: r.color }}>{fmt(r.value)}</span>
+                <span className="mono" style={{ color: r.value === null ? "var(--text3)" : r.color }}>{r.value === null ? "—" : fmt(r.value)}</span>
               </div>
             ))}
             <div className="pl-net" style={{ marginTop: 12 }}>
               <span style={{ fontFamily: "var(--font-sans)", fontWeight: 800, fontSize: 14 }}>Ending Cash Balance</span>
-              <span className="mono" style={{ fontSize: 22, color: "var(--accent)" }}>{fmt(endBalance)}</span>
+              <span className="mono" style={{ fontSize: 22, color: endBalance === null ? "var(--text3)" : endBalance >= 0 ? "var(--accent)" : "var(--red)" }}>
+                {endBalance === null ? "—" : fmt(endBalance)}
+              </span>
             </div>
+            {canRoll && (
+              <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)", marginTop: 8 }}>
+                Saldo bancário de {anchorDate}, rolado com as linhas até {dateRange.end}
+              </div>
+            )}
           </div>
+
+          {cashAccounts.length > 0 && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 12 }}>Cash by Account</div>
+              {cashAccounts.map(a => (
+                <div key={a.id} className="flex items-center justify-between" style={{ padding: "7px 0", borderBottom: "1px solid var(--border)" }}>
+                  <span style={{ fontSize: 12, color: "var(--text2)" }}>{a.name}</span>
+                  <span className="mono" style={{ fontSize: 12 }}>{fmt(rollBalance(a, dateRange.end || "9999-12-31"))}</span>
+                </div>
+              ))}
+              {debtAccounts.length > 0 && (
+                <div className="flex items-center justify-between" style={{ marginTop: 10, paddingTop: 10 }}>
+                  <span style={{ fontSize: 12, color: "var(--text2)" }}>Credit cards &amp; loans ({debtAccounts.length})</span>
+                  <span className="mono" style={{ fontSize: 12, color: "var(--red)" }}>{fmt(cardDebt)}</span>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="card">
             <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 12 }}>Cash Flow Health</div>
             {[
-              { label: "Operating Cash Ratio", value: netOperating >= 0 ? "Positive ✓" : "Negative ⚠", ok: netOperating >= 0 },
-              { label: "Cash Burn Rate", value: fmt(opOutflow / 30) + "/day", ok: true },
-              { label: "Runway (at current burn)", value: Math.round(endBalance / (opOutflow / 30)) + " days", ok: true },
-              { label: "Collections Efficiency", value: ((opInflow / (opInflow + Math.abs(netInvesting))) * 100).toFixed(0) + "%", ok: true },
+              { label: "Operating cash", value: sectionTotals.operating >= 0 ? "Positive ✓" : "Negative ⚠", ok: sectionTotals.operating >= 0 },
+              { label: "Outflow per day", value: fmt(outflowPerDay) + "/day", ok: true },
+              {
+                label: "Runway (at current net burn)",
+                value: endBalance === null ? "—" : netBurnPerDay <= 0 ? "Not burning ✓" : Math.max(0, Math.round(endBalance / netBurnPerDay)) + " days",
+                ok: netBurnPerDay <= 0 || (endBalance !== null && endBalance / netBurnPerDay > 30),
+              },
+              {
+                label: "Net position (cash − debt)",
+                value: endBalance === null ? "—" : fmt(endBalance + cardDebt),
+                ok: endBalance !== null && endBalance + cardDebt >= 0,
+              },
             ].map(r => (
               <div key={r.label} className="flex items-center justify-between" style={{ padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
                 <span style={{ fontSize: 12, color: "var(--text2)" }}>{r.label}</span>
@@ -4171,8 +4453,41 @@ function CashFlow({ transactions, categories, recurring = [], dateRange = {} }) 
         </div>
       </div>
 
+      {/* Mês a mês — é aqui que se vê o caixa virando, não no total do período. */}
+      {monthly.length > 0 && (
+        <div className="card" style={{ marginTop: 18 }}>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13, marginBottom: 14 }}>Month by Month</div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Month</th>
+                  <th style={{ textAlign: "right" }}>Inflow</th>
+                  <th style={{ textAlign: "right" }}>Outflow</th>
+                  <th style={{ textAlign: "right" }}>Net</th>
+                  <th style={{ textAlign: "right" }}>Ending balance</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monthly.map(m => (
+                  <tr key={m.key}>
+                    <td className="mono" style={{ color: "var(--text2)" }}>{m.key}</td>
+                    <td className="amount-pos text-right">{fmt(m.inflow)}</td>
+                    <td className="amount-neg text-right">{fmt(m.outflow)}</td>
+                    <td className={m.net >= 0 ? "amount-pos text-right" : "amount-neg text-right"}>{fmt(m.net)}</td>
+                    <td className="mono text-right" style={{ color: m.balance === undefined ? "var(--text3)" : m.balance >= 0 ? "var(--text)" : "var(--red)" }}>
+                      {m.balance === undefined ? "—" : fmt(m.balance)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Recurring forecast */}
-      {recurring.filter(r => r.status === "active").length > 0 && (() => {
+      {endBalance !== null && recurring.filter(r => r.status === "active").length > 0 && (() => {
         const forecast = projectRecurring(recurring, 3);
         const forecastNet = forecast.reduce((s, m) => s + m.net, 0);
         let cumulative = endBalance;
@@ -10406,7 +10721,7 @@ export default function App() {
       case "categories":   return <Categories categories={categories} setCategories={setCategories} saveCategory={saveCategory} deleteCategory={async(id)=>{setCategories(p=>p.filter(c=>c.id!==id));if(TENANT_ID!=="demo")await deleteCategory(id);}} transactions={filteredByDate} showToast={showToast} />;
       case "pl":           return <PLReport transactions={filteredByAccrual} allTransactions={transactions} categories={categories} dateRange={dateRange} setTransactions={setTransactions} deleteTxn={async(id)=>{if(TENANT_ID!=="demo")await deleteTransaction(id);}} payrollRuns={payrollRuns} tenantId={TENANT_ID} showToast={showToast} />;
       case "trends":       return <Trends tenantId={TENANT_ID} categories={categories} allTransactions={transactions} />;
-      case "cashflow":     return <CashFlow transactions={filteredByDate} categories={categories} recurring={recurring} dateRange={dateRange} />;
+      case "cashflow":     return <CashFlow transactions={filteredByDate} allTransactions={transactions} categories={categories} bankAccounts={bankAccounts} recurring={recurring} dateRange={dateRange} />;
       case "budget":       return <Budget transactions={filteredByDate} categories={categories} budgets={budgets} setBudgets={setBudgets} saveBudget={saveBudget} showToast={showToast} />;
       case "bills":        return <Bills transactions={filteredByDate} setTransactions={setTransactions} bills={bills} setBills={setBills} saveBill={saveBill} deleteB={async(id)=>{setBills(p=>p.filter(b=>b.id!==id));if(TENANT_ID!=="demo")await deleteBill(id);}} categories={categories} dateRange={dateRange} showToast={showToast} saveTransactions={saveTransactions} />;
       case "recurring":    return <Recurring recurring={recurring} setRecurring={setRecurring} saveRecurring={saveRecurring} deleteR={async(id)=>{setRecurring(p=>p.filter(r=>r.id!==id));if(TENANT_ID!=="demo")await deleteRecurring(id);}} categories={categories} transactions={transactions} showToast={showToast} />;
