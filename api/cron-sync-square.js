@@ -11,13 +11,17 @@
 // active tenants from clv_tenants / r7_tenants instead.
 
 export default async function handler(req, res) {
-  // Vercel sets this header on cron invocations. If CRON_SECRET is configured,
-  // require it so the endpoint can't be triggered by arbitrary callers.
+  // CRON_SECRET is now load-bearing in both directions: Vercel sets it on the
+  // incoming cron invocation, and it's the only credential this wrapper can
+  // present to the sync endpoints (which require a caller since they run as
+  // service role — see api/_auth.js). No secret means no way to authenticate
+  // downstream, so refuse loudly instead of firing four calls that all 401.
   const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const auth = req.headers.authorization || "";
-    if (auth !== `Bearer ${secret}`) return res.status(401).json({ error: "unauthorized" });
+  if (!secret) {
+    return res.status(500).json({ error: "CRON_SECRET not configured — sync endpoints cannot be authenticated" });
   }
+  const auth = req.headers.authorization || "";
+  if (auth !== `Bearer ${secret}`) return res.status(401).json({ error: "unauthorized" });
 
   const tenantId = process.env.VITE_TENANT_ID;
   if (!tenantId || tenantId === "demo") {
@@ -56,7 +60,12 @@ export default async function handler(req, res) {
     try {
       const r = await fetch(`${base}/api/${ep}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // The sync endpoints accept either a logged-in user's Supabase token
+          // or this shared secret. Cron has no user session, so it's this.
+          "Authorization": `Bearer ${secret}`,
+        },
         body: JSON.stringify({ tenant_id: tenantId }),
       });
       if (r.ok) {
