@@ -3,7 +3,7 @@
 Bookkeeping & financial intelligence platform for restaurant operators. Part of the Favo ecosystem (companion to **Favo Kitchen / Restauran7**).
 
 **Live:** [cfo.favo.team](https://cfo.favo.team)
-**Repo:** [github.com/eandersontorres/Clariva-CFO](https://github.com/eandersontorres/Clariva-CFO)
+**Repo:** [github.com/eandersontorres/favo-cfo](https://github.com/eandersontorres/favo-cfo)
 **Pilot tenant:** TorresBee Restaurant — Round Rock, TX (`tenant_id: 5dc58fa8-0a0a-4d24-8906-e32755e36e93`)
 
 ---
