@@ -21,9 +21,10 @@
 --   2026-08   51 linhas   US$  9.646,33
 --   2026-09   17 linhas   US$  3.951,95
 --
--- NÃO APLICADO AUTOMATICAMENTE. Rodar no SQL editor depois de conferir a
--- prévia (bloco 1). Backup em r7_ledger_txns_backup_kitchen_shadow_dupes;
--- o bloco 4 desfaz.
+-- APLICADO EM PRODUÇÃO em 29/09/2026: 78 pais (US$ 17.231,68) + 26 filhos de
+-- split levados por cascade. Backup em r7_ledger_txns_backup_kitchen_shadow_dupes
+-- (104 linhas); o bloco 4 desfaz. Este arquivo fica para registrar o que foi
+-- feito e como reverter.
 
 -- ── 1. Prévia: o que vai sair ───────────────────────────────────────────────
 WITH paid_pids AS (
