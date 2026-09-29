@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
-import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
+import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, fetchPurchaseAllocations, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
@@ -700,6 +700,52 @@ function makeLedgerFilter(categories, allTxns) {
   };
 }
 
+// Drop a Kitchen invoice shadow AND its split children from local state. The
+// database does this on its own (parent_id is ON DELETE CASCADE), so every
+// place that deletes a shadow only has to delete the parent -- but the local
+// array has no cascade, and a child left behind would keep counting until the
+// next reload.
+function withoutShadowRows(rows, parentIds) {
+  const ids = parentIds instanceof Set ? parentIds : new Set([parentIds].flat().filter(Boolean));
+  if (ids.size === 0) return rows;
+  return rows.filter(t => !ids.has(t.id) && !ids.has(t.parent_id));
+}
+
+// The Kitchen purchase behind a bill, from either stream that can carry one:
+//   - bills the CFO derived from the shadow:  id = bill_kitchen_purchase_<pid>,
+//     txnId = kitchen_purchase_<pid> until the bank row replaces it
+//   - bills the Kitchen purchase bridge wrote: source = purchase:bridged:<PO>,
+//     notes carry "r7_purchases.id=<pid>"
+// Every rule that says "the bank row is the record, the shadow goes" has to
+// see both. It used to test source === "kitchen" only, so an invoice paid
+// through a bridged bill kept its shadow -- 86 of them at TorresBee.
+function kitchenPurchaseIdOf(bill) {
+  if (!bill) return null;
+  const fromTxn = String(bill.txnId || "").match(/^kitchen_purchase_(.+)$/);
+  if (fromTxn) return fromTxn[1];
+  const fromId = String(bill.id || "").match(/^bill_kitchen_purchase_(.+)$/);
+  if (fromId) return fromId[1];
+  const fromNotes = String(bill.notes || "").match(/r7_purchases\.id=(\d+)/);
+  if (fromNotes) return fromNotes[1];
+  return null;
+}
+function kitchenShadowIdOf(bill) {
+  const pid = kitchenPurchaseIdOf(bill);
+  return pid ? "kitchen_purchase_" + pid : null;
+}
+
+// Purchase ids whose bill is already paid. Sync Kitchen skips these so a
+// settled invoice does not come back as a shadow.
+function paidKitchenPurchaseIds(bills) {
+  const out = new Set();
+  for (const b of bills || []) {
+    if (b.status !== "paid") continue;
+    const pid = kitchenPurchaseIdOf(b);
+    if (pid) out.add(pid);
+  }
+  return out;
+}
+
 // Split a set of ledger rows into income and expense totals. Which side a row
 // lands on is decided by its category type, NOT by the sign of the amount: a
 // vendor refund is a credit posted to an expense account and has to reduce that
@@ -1075,10 +1121,21 @@ function KitchenSyncButton({ tenantId, categories, dateRange, onSync, showToast 
       const vendorMap = {};
       vendors.forEach(v => { vendorMap[v.id] = v.name; });
 
-      // Find category IDs
-      const foodBevCat = categories.find(c => c.name === "Food & Beverage" || c.tax_line === "COGS");
+      // Default account for an invoice Kitchen cannot break down. Name first,
+      // then any COGS line: a single `find` over "name OR tax_line" used to
+      // return "Beverage" because it sorts before "Food & Beverage", and 65
+      // Sysco / US Foods invoices landed as beverage in one month.
+      const foodBevCat = categories.find(c => c.name === "Food & Beverage")
+        || categories.find(c => isCogs(c));
 
-      const expTxns = purchasesToTransactions(purchases, vendorMap, foodBevCat?.id);
+      // Per-invoice breakdown by ledger account, from Kitchen's line items.
+      // Best-effort: if the lookup fails the invoice lands whole in the
+      // default account, exactly as before.
+      let allocations = null;
+      try { allocations = await fetchPurchaseAllocations(purchases, tenantId); }
+      catch (e) { console.error("Sync Kitchen: allocation lookup failed", e); }
+
+      const expTxns = purchasesToTransactions(purchases, vendorMap, foodBevCat?.id, allocations);
       const mapped = expTxns.map(t => ({ ...t, category: t.category_id || UNCATEGORIZED }));
       const all = mapped.filter(inOpenPeriod);
       const lockedOut = mapped.length - all.length;
@@ -1090,7 +1147,11 @@ function KitchenSyncButton({ tenantId, categories, dateRange, onSync, showToast 
       } else {
         onSync(all);
         setLastSync(new Date());
-        showToast(all.length + " vendor invoice(s) synced from Kitchen" + (lockedOut > 0 ? ` · ${lockedOut} skipped (closed period)` : ""), "success");
+        const invoices = all.filter(t => !t.parent_id).length;
+        const splitCount = new Set(all.filter(t => t.parent_id).map(t => t.parent_id)).size;
+        showToast(invoices + " vendor invoice(s) synced from Kitchen"
+          + (splitCount > 0 ? ` · ${splitCount} split by line item` : "")
+          + (lockedOut > 0 ? ` · ${lockedOut} skipped (closed period)` : ""), "success");
       }
     } catch (err) {
       showToast("Sync failed: " + err.message, "error");
@@ -1935,9 +1996,8 @@ function SplitModal({ txn, categories, payrollRuns = [], onClose, onSave, transa
 // the row still reconciled. Bookkeeping that half-applies is worse than
 // bookkeeping that does not apply.
 async function applyInvoiceSplit(txn, bill, showToast) {
-  if (!bill || bill.source !== "kitchen" || !bill.txnId) return;
-  const purchaseId = String(bill.txnId).replace(/^kitchen_purchase_/, "");
-  if (!purchaseId || purchaseId === bill.txnId) return;
+  const purchaseId = kitchenPurchaseIdOf(bill);
+  if (!purchaseId) return;
   try {
     const buckets = await fetchPurchaseAllocation(purchaseId, TENANT_ID);
     const rows = prorateAllocation(buckets, Math.abs(txn.amount));
@@ -2431,7 +2491,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     // The Kitchen invoice shadow and the bank debit are the same expense. The
     // bank row is the system of record, so the shadow goes — the same rule the
     // Bills auto-reconcile follows, and without it the P&L counts it twice.
-    const shadowId = bill.source === "kitchen" && bill.txnId && bill.txnId !== txn.id ? bill.txnId : null;
+    const shadowId = kitchenShadowIdOf(bill) !== txn.id ? kitchenShadowIdOf(bill) : null;
     const inheritCat = (!txn.category || txn.category === UNCATEGORIZED)
       && bill.category && bill.category !== UNCATEGORIZED;
     const updated = {
@@ -2441,8 +2501,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
       autoCategorized: false,
       notes: (txn.notes ? txn.notes + " · " : "") + `Pays invoice ${bill.vendor} ${bill.dueDate}`,
     };
-    setTransactions(prev => prev
-      .filter(t => t.id !== shadowId)
+    setTransactions(prev => withoutShadowRows(prev, shadowId)
       .map(t => (t.id === txn.id ? updated : t)));
     saveTransactions?.([updated]);
     if (shadowId) deleteTxn?.(shadowId);
@@ -5771,7 +5830,8 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
         txnId: m.id,
         notes: (bill.notes ? bill.notes + " · " : "") + "Auto-matched to bank transaction",
       });
-      if (bill.source === "kitchen" && bill.txnId && bill.txnId !== m.id) dropTxnIds.push(bill.txnId);
+      const shadowId = kitchenShadowIdOf(bill);
+      if (shadowId && shadowId !== m.id) dropTxnIds.push(shadowId);
       splitJobs.push({ txn: m, bill });
       const needCat = (!m.category || m.category === UNCATEGORIZED) && bill.category && bill.category !== UNCATEGORIZED;
       if (needCat) editTxns.push({ ...m, category: bill.category, reconciled: true });
@@ -5787,8 +5847,7 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
     if (dropTxnIds.length || editTxns.length) {
       const dropSet = new Set(dropTxnIds);
       const editMap = new Map(editTxns.map(t => [t.id, t]));
-      setTransactions(prev => prev
-        .filter(t => !dropSet.has(t.id))
+      setTransactions(prev => withoutShadowRows(prev, dropSet)
         .map(t => editMap.get(t.id) || t)
       );
       if (editTxns.length && saveTransactions) saveTransactions(editTxns);
@@ -5855,14 +5914,15 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
       source: "bill_payment",
       notes: payForm.notes || ("Bill paid via " + payForm.method),
     };
-    setTransactions(prev => {
-      // Remove old kitchen_purchase txn and replace with payment txn
-      const without = prev.filter(t => t.id !== selected.txnId);
-      return [newTxn, ...without];
-    });
+    // The payment row replaces the Kitchen invoice shadow. This used to drop
+    // the shadow from local state only, so it was back on the next load and
+    // the expense counted twice; the delete has to reach the database.
+    const shadowId = kitchenShadowIdOf(selected);
+    setTransactions(prev => [newTxn, ...withoutShadowRows(prev, shadowId)]);
 
     if (saveBill) saveBill({ ...selected, status: "paid", paidDate: payForm.date, paidMethod: payForm.method, notes: payForm.notes });
     if (saveTransactions) saveTransactions([newTxn]);
+    if (shadowId && TENANT_ID !== "demo") deleteTransaction(shadowId).catch(e => console.error("payBill: delete shadow", e));
     showToast("Bill paid! " + fmt(selected.amount) + " to " + selected.vendor, "success");
     setModal(null);
     setSelected(null);
@@ -10885,7 +10945,9 @@ export default function App() {
   // would duplicate Kitchen's data and leave orphans when a purchase is
   // deleted there.
   useEffect(() => {
-    const kitchenTxns = transactions.filter(t => t.source === "kitchen_purchase");
+    // Parents only: a split child is a slice of the same invoice, not a
+    // second bill.
+    const kitchenTxns = transactions.filter(t => t.source === "kitchen_purchase" && !t.parent_id);
     if (kitchenTxns.length === 0) return;
     setBills(prev => {
       const existingTxnIds = new Set(prev.map(b => b.txnId));
@@ -10925,14 +10987,35 @@ export default function App() {
   };
 
   // ── Kitchen sync handler ────────────────────────────────────
+  // Sync Kitchen writes one shadow per invoice (plus split children when the
+  // line items span accounts -- see purchasesToTransactions). Two things it
+  // must NOT do:
+  //   - Re-create a shadow the bill flow already removed. Auto-reconcile,
+  //     match-invoice and Pay Bill all delete the shadow once the bank debit
+  //     is the record; a sync that only checks "is this id in the ledger?"
+  //     brought it straight back, and the P&L counted the invoice twice.
+  //     TorresBee had $17k of that across Jul-Sep 2026.
+  //   - Re-add an invoice the operator deleted by hand. Same test covers it
+  //     only when a paid bill exists; a bare delete still comes back, which
+  //     is the pre-existing behaviour.
   const handleKitchenSync = async (imported) => {
     const linked = applyAccountLink(imported, bankAccounts);
+    const paidPurchases = paidKitchenPurchaseIds(bills);
+    const purchaseIdOf = (t) => String(t.parent_id || t.id).replace(/^kitchen_purchase_/, "");
+    const live = linked.filter(t => !paidPurchases.has(purchaseIdOf(t)));
+
     const existingIds = new Set(transactions.map(t => t.id));
-    const newOnes = linked.filter(t => !existingIds.has(t.id));
-    if (newOnes.length > 0) {
-      setTransactions(prev => [...newOnes, ...prev]);
-      await saveTransactions(newOnes);
-    }
+    const newOnes = live.filter(t => !existingIds.has(t.id));
+    // A parent that already exists but is gaining children now was synced
+    // before line-item splitting: re-save it so its category follows the
+    // breakdown (it used to say "Beverage" for a Sysco invoice).
+    const newChildParents = new Set(newOnes.filter(t => t.parent_id).map(t => t.parent_id));
+    const refreshed = live.filter(t => !t.parent_id && existingIds.has(t.id) && newChildParents.has(t.id));
+    const toSave = [...refreshed, ...newOnes];
+    if (toSave.length === 0) return;
+    const refreshedById = new Map(refreshed.map(t => [t.id, t]));
+    setTransactions(prev => [...newOnes, ...prev.map(t => refreshedById.has(t.id) ? { ...t, ...refreshedById.get(t.id) } : t)]);
+    await saveTransactions(toSave);
   };
 
   // ── Marketing sync handler ──────────────────────────────────

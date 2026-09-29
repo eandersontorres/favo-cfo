@@ -437,6 +437,12 @@ There are three ways a bill gets paid, in order of how much the operator has to 
 
 Nothing un-pays a bill yet, on any of the three paths.
 
+**Two bill streams reference the same purchase.** The CFO derivation above (`id = bill_kitchen_purchase_<pid>`) and the Kitchen purchase bridge (`source = purchase:bridged:<PO>`, notes carry `r7_purchases.id=<pid>`). `kitchenPurchaseIdOf(bill)` resolves either to the purchase; every "the bank row is the record, the shadow goes" rule goes through it. Testing `source === "kitchen"` alone left the shadow behind for every bridged bill.
+
+**Sync Kitchen skips a purchase whose bill is paid** (`paidKitchenPurchaseIds`). The dedupe used to be "is this id in the ledger?", so a shadow the bill flow had just deleted came straight back on the next sync and the invoice counted twice — Jul–Sep 2026 had $17k of that. `supabase_cleanup_kitchen_shadow_dupes.sql` removes the ones created before the fix (manual, with backup).
+
+**The shadow is written already split by line item.** `purchasesToTransactions` takes the per-invoice breakdown from `fetchPurchaseAllocations` (Kitchen item → `r7_items.catId` → `r7_ledger_kitchen_category_map` → ledger account) and, when it spans more than one account, writes a parent with the invoice total plus children `kitchen_purchase_<pid>_alloc_<n>` per account. Children keep `source='kitchen_purchase'` and are told apart by `parent_id`; `makeLedgerFilter` drops the parent, so P&L / Insights / Budget count the children. A line Kitchen has not categorised becomes an `UNCATEGORIZED` child, on purpose. The bill derivation and every shadow delete handle parent + children (`withoutShadowRows`; the DB cascades on `parent_id`).
+
 ---
 
 ## Common Tasks

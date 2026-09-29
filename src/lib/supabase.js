@@ -484,40 +484,72 @@ export async function fetchPurchaseAllocation(purchaseId, tenantId) {
   if (!purchaseId || tid === 'demo') return []
 
   const { data: pur, error: pErr } = await supabase
-    .from('r7_purchases').select('items').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
+    .from('r7_purchases').select('id, items').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
   if (pErr || !pur) { if (pErr) console.error('fetchPurchaseAllocation/purchase', pErr); return [] }
 
-  const items = parseItems(pur.items)
-  if (items.length === 0) return []
+  const all = await fetchPurchaseAllocations([pur], tid)
+  return all.get(String(pur.id)) || []
+}
 
-  const mappedIds = [...new Set(items.map(i => i?._mappedItemId).filter(Boolean).map(String))]
+/**
+ * Same breakdown for MANY purchases in three queries instead of three per
+ * purchase. Sync Kitchen runs this over every invoice in the date range (75 in
+ * a month at TorresBee), so the per-purchase version would be 225 round trips.
+ *
+ * @param purchases rows from r7_purchases that carry `items` (fetchKitchenPurchases
+ *   selects *, so they do)
+ * @returns {Promise<Map<string, Array<{categoryId, amount}>>>} keyed by purchase id.
+ *   A purchase with no usable line items is absent from the map -- the caller
+ *   falls back to the single-category shadow, exactly as before.
+ */
+export async function fetchPurchaseAllocations(purchases, tenantId) {
+  const tid = tenantId || TENANT()
+  const out = new Map()
+  if (tid === 'demo' || !purchases || purchases.length === 0) return out
+
+  const itemsByPurchase = new Map()
+  const mappedIds = new Set()
+  for (const p of purchases) {
+    const items = parseItems(p?.items)
+    if (items.length === 0) continue
+    itemsByPurchase.set(String(p.id), items)
+    for (const it of items) if (it?._mappedItemId) mappedIds.add(String(it._mappedItemId))
+  }
+  if (itemsByPurchase.size === 0) return out
+
   const catByItem = new Map()
-  if (mappedIds.length > 0) {
+  const ids = [...mappedIds]
+  // PostgREST puts the `in` list in the URL; keep each request well under the
+  // length limit.
+  for (let i = 0; i < ids.length; i += 200) {
     const { data: rows, error } = await supabase
-      .from('r7_items').select('id, catId').eq('tenant_id', tid).in('id', mappedIds)
-    if (error) console.error('fetchPurchaseAllocation/items', error)
+      .from('r7_items').select('id, catId').eq('tenant_id', tid).in('id', ids.slice(i, i + 200))
+    if (error) { console.error('fetchPurchaseAllocations/items', error); continue }
     for (const r of (rows || [])) catByItem.set(String(r.id), r.catId == null ? null : String(r.catId))
   }
 
   const { data: mapRows, error: mErr } = await supabase
     .from('r7_ledger_kitchen_category_map')
     .select('kitchen_category_id, ledger_account_id').eq('tenant_id', tid)
-  if (mErr) console.error('fetchPurchaseAllocation/map', mErr)
+  if (mErr) console.error('fetchPurchaseAllocations/map', mErr)
   const acctByCat = new Map((mapRows || []).map(r => [String(r.kitchen_category_id), r.ledger_account_id]))
 
-  const buckets = new Map()
-  for (const it of items) {
-    const v = lineValue(it)
-    if (v === 0) continue
-    const kcat = catByItem.get(String(it?._mappedItemId ?? ''))
-    const acct = kcat ? (acctByCat.get(kcat) || null) : null
-    buckets.set(acct, (buckets.get(acct) || 0) + v)
+  for (const [pid, items] of itemsByPurchase) {
+    const buckets = new Map()
+    for (const it of items) {
+      const v = lineValue(it)
+      if (v === 0) continue
+      const kcat = catByItem.get(String(it?._mappedItemId ?? ''))
+      const acct = kcat ? (acctByCat.get(kcat) || null) : null
+      buckets.set(acct, (buckets.get(acct) || 0) + v)
+    }
+    const list = [...buckets.entries()]
+      .map(([categoryId, amount]) => ({ categoryId, amount }))
+      .filter(b => Math.abs(b.amount) > 0.0001)
+      .sort((a, b) => b.amount - a.amount)
+    if (list.length > 0) out.set(pid, list)
   }
-
-  return [...buckets.entries()]
-    .map(([categoryId, amount]) => ({ categoryId, amount }))
-    .filter(b => Math.abs(b.amount) > 0.0001)
-    .sort((a, b) => b.amount - a.amount)
+  return out
 }
 
 /**
@@ -1116,24 +1148,66 @@ export async function fetchMarketingSpend(tenantId, { start, end } = {}) {
 }
 
 // ─── CONVERTERS ───────────────────────────────────────────────────────────────
-export function purchasesToTransactions(purchases, vendorMap = {}, foodBevCategoryId) {
-  return purchases.map(p => {
+// One Kitchen invoice becomes one ledger shadow. When the invoice's line items
+// resolve to more than one ledger account (a Restaurant Depot run that is food
+// AND cleaning supplies), the shadow is written already split: the parent
+// carries the invoice total and the children carry the per-account shares.
+// makeLedgerFilter drops split parents, so the P&L, Insights and Budget count
+// the children -- food cost stops absorbing the Windex the day the invoice is
+// scanned, instead of waiting for a bank match that may never come.
+//
+// Children reuse source='kitchen_purchase' on purpose: every rule that keeps
+// the shadow out of cash flow, out of the bill matcher and out of the
+// "needs a receipt" list applies to them unchanged. They are told apart from
+// the parent by parent_id alone. Ids are deterministic so re-syncing the same
+// invoice upserts instead of duplicating.
+//
+// A line item Kitchen has not categorised lands in an UNCATEGORIZED child. It
+// shows up in the Transactions review tab and asks for a decision; guessing
+// "food" would hide the gap it is there to expose.
+export function purchasesToTransactions(purchases, vendorMap = {}, foodBevCategoryId, allocations = null) {
+  return purchases.flatMap(p => {
     // r7_purchases stores the supplier name inline AND a vendorId FK; prefer
     // the inline supplier (always populated by Kitchen's invoice scanner),
     // fall back to vendorMap lookup, then to a generic label.
     const vendor = p.supplier || vendorMap[p.vendorId] || vendorMap[p.vendor_id] || 'VENDOR PURCHASE';
-    return {
-      id: 'kitchen_purchase_' + p.id,
+    const parentId = 'kitchen_purchase_' + p.id
+    const total = -(parseFloat(p.total) || 0)
+    const buckets = allocations?.get?.(String(p.id)) || []
+    const shares = prorateAllocation(buckets, Math.abs(total))
+    // Single-bucket invoice: no children, but the parent takes that account
+    // when Kitchen knows it. An invoice whose items are all unmapped keeps the
+    // default, so one scanned before item mapping existed behaves as before.
+    const lead = shares.length >= 2 ? shares[0] : buckets[0]
+    const parentCat = (lead && lead.categoryId) || foodBevCategoryId || null
+    const parent = {
+      id: parentId,
       date: p.date,
       description: String(vendor).toUpperCase(),
-      amount: -(parseFloat(p.total) || 0),
-      category_id: foodBevCategoryId || null,
-      category: foodBevCategoryId || UNCATEGORIZED,
+      amount: total,
+      category_id: parentCat,
+      category: parentCat || UNCATEGORIZED,
       account: 'Kitchen Sync',
       reconciled: false,
       source: 'kitchen_purchase',
       notes: p.invoice_path ? 'Invoice: ' + p.invoice_path : '',
     };
+    if (shares.length < 2) return [parent]
+    const children = shares.map((sh, n) => ({
+      id: `${parentId}_alloc_${n}`,
+      parent_id: parentId,
+      date: p.date,
+      description: parent.description,
+      amount: -Math.abs(sh.amount),
+      category_id: sh.categoryId || null,
+      category: sh.categoryId || UNCATEGORIZED,
+      account: 'Kitchen Sync',
+      reconciled: false,
+      source: 'kitchen_purchase',
+      notes: sh.categoryId ? 'Line items from Kitchen invoice' : 'Line items Kitchen has not categorised yet',
+    }))
+    // Parent first: parent_id is a foreign key onto the same table.
+    return [parent, ...children]
   })
 }
 
