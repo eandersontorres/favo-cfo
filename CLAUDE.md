@@ -154,7 +154,7 @@ Read from sibling Favo modules:
     - `CEO` (CEO Cockpit — equipment ROI calculator)
     - `Bookkeeper` 🇺🇸 (8 rules-based IRS Schedule C checks, compliance score)
     - `Labor` 🇺🇸 (Square shifts, loaded cost, payroll variance)
-    - `Payroll` 🇺🇸 (nested under Labor — prep + Paychex CSV export)
+    - `Payroll` 🇺🇸 (nested under Labor — prep + Paychex CSV export, bank vs calculated per run: `matchPayrollRunsToBank()` assigns each Paychex/ADP/Gusto debit to the nearest run within ±7 days, nearest-wins so nothing is counted twice)
     - `Tips` 🇺🇸 (nested under Payroll — card tips, auto-grat, pooling)
     - `Projects` (future investments timeline/board/list)
     - `Transactions` (review-first: Uncategorized / Categorized tabs, import drop zone, 🧾 match-invoice → mark bill paid)

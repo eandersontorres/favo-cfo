@@ -7973,6 +7973,125 @@ function exportPayrollCSV(run) {
   a.click();
 }
 
+// ─── Payroll: bank vs calculated ─────────────────────────────────────────
+// A run carries up to two *calculated* numbers; the bank carries the *paid*
+// one. They come from different places and deserve different trust:
+//   - totals.total_cash_out    Favo's own estimate (Square hours × rate + burden)
+//   - totals.total_bank_debit  the processor's number — a paystub PDF today, a
+//                              Paychex API pull tomorrow; totals.paystub_meta.source
+//                              says which, and the label follows it
+//   - the ledger               Paychex / ADP / Gusto ACH debits near the pay date
+// The screen lines the three up so a drift shows the day the bank row lands,
+// not at Schedule C time.
+const PAYROLL_BANK_WINDOW_DAYS = 7;
+const PAYROLL_BANK_DESC_RE = /paychex|payroll|adp|gusto/i;
+// Rows CFO itself wrote into the ledger (submitRun shadow, paystub shadows).
+// Their descriptions say "PAYROLL", so the regex alone would count them as
+// money the bank moved.
+const PAYROLL_SYNTHETIC_SOURCES = new Set(["payroll_run", "paystub_shadow"]);
+const PAYROLL_CALC_SOURCE_LABEL = { paystub_pdf: "Paystub PDF", paychex_api: "Paychex" };
+
+// Paychex splits one pay period into 2-3 bank rows: PAYROLL (direct deposits),
+// TAXES / TPS (withholdings + employer match) and EIB INVOICE (its own fee).
+function classifyPayrollBankRow(t) {
+  const desc = (t.description || "").toLowerCase();
+  if (/eib|invoice/.test(desc)) return "fee";
+  if (/tps|taxes/.test(desc)) return "taxes";
+  return "payroll";
+}
+
+function isPayrollBankDebit(t) {
+  if (PAYROLL_SYNTHETIC_SOURCES.has(t.source)) return false;
+  const amt = parseFloat(t.amount);
+  if (isNaN(amt) || amt >= 0) return false;
+  return PAYROLL_BANK_DESC_RE.test(t.description || "");
+}
+
+// The date the processor actually hits the bank: paystub check date first,
+// then the pay date the operator typed, then period end as a last resort.
+function payrollRunAnchorDate(run) {
+  return run?.totals?.check_date || run?.pay_date || run?.period_end || null;
+}
+
+// Assign every payroll-looking bank debit to the run whose anchor date is
+// nearest, within ±PAYROLL_BANK_WINDOW_DAYS. Nearest-wins, so a debit sitting
+// between two biweekly runs is counted once, never on both.
+// Returns Map<runId, comparison>.
+function matchPayrollRunsToBank(runs, transactions) {
+  const dayMs = 86400000;
+  const anchors = (runs || [])
+    .filter(r => r.status !== "cancelled" && payrollRunAnchorDate(r))
+    .map(r => ({ run: r, ms: new Date(payrollRunAnchorDate(r) + "T12:00:00").getTime() }))
+    .filter(a => !isNaN(a.ms));
+  const grouped = new Map();
+  for (const a of anchors) grouped.set(a.run.id, { payroll: [], taxes: [], fee: [] });
+  for (const t of (transactions || [])) {
+    if (!isPayrollBankDebit(t)) continue;
+    const tMs = new Date(String(t.date).slice(0, 10) + "T12:00:00").getTime();
+    if (isNaN(tMs)) continue;
+    let best = null, bestDist = Infinity;
+    for (const a of anchors) {
+      const dist = Math.abs(tMs - a.ms);
+      if (dist <= PAYROLL_BANK_WINDOW_DAYS * dayMs && dist < bestDist) { best = a; bestDist = dist; }
+    }
+    if (!best) continue;
+    grouped.get(best.run.id)[classifyPayrollBankRow(t)].push(t);
+  }
+  const sum = arr => Math.abs(arr.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0));
+  const out = new Map();
+  for (const a of anchors) {
+    const rows = grouped.get(a.run.id);
+    const totals = a.run.totals || {};
+    const bankPaid = round2(sum(rows.payroll) + sum(rows.taxes));
+    const bankFee = round2(sum(rows.fee));
+    const hasBank = rows.payroll.length + rows.taxes.length > 0;
+    const favoEstimate = round2(totals.total_cash_out);
+    const processorCalc = round2(totals.total_bank_debit);
+    const processorLabel = PAYROLL_CALC_SOURCE_LABEL[totals.paystub_meta?.source] || (totals.paystub_meta?.source ? String(totals.paystub_meta.source) : "Processor");
+    // The processor's number wins when both exist — it is what Paychex will
+    // actually pull; Favo's estimate is the pre-run forecast.
+    const calculated = processorCalc > 0 ? processorCalc : favoEstimate > 0 ? favoEstimate : null;
+    const calcSource = processorCalc > 0 ? processorLabel : favoEstimate > 0 ? "Favo estimate" : null;
+    const delta = hasBank && calculated != null ? round2(bankPaid - calculated) : null;
+    const deltaPct = delta != null && calculated > 0 ? (delta / calculated) * 100 : null;
+    const anchorPast = a.ms < Date.now() - PAYROLL_BANK_WINDOW_DAYS * dayMs;
+    let status;
+    if (!hasBank) status = anchorPast ? "missing" : "pending";
+    else if (calculated == null) status = "no_calc";
+    else if (Math.abs(delta) <= 1) status = "match";
+    else if (Math.abs(deltaPct) <= 2) status = "close";
+    else status = "drift";
+    out.set(a.run.id, {
+      anchor: payrollRunAnchorDate(a.run),
+      rows, bankPaid, bankFee, hasBank,
+      favoEstimate, processorCalc, processorLabel,
+      calculated, calcSource, delta, deltaPct, status,
+    });
+  }
+  return out;
+}
+
+const PAYROLL_MATCH_STATUS = {
+  match:   { label: "matches bank",   color: "var(--accent)" },
+  close:   { label: "within 2%",      color: "var(--yellow)" },
+  drift:   { label: "drift",          color: "var(--red)" },
+  pending: { label: "awaiting bank",  color: "var(--text3)" },
+  missing: { label: "no bank debit",  color: "var(--yellow)" },
+  no_calc: { label: "no calculated",  color: "var(--text3)" },
+};
+
+function PayrollMatchTag({ status, delta }) {
+  const m = PAYROLL_MATCH_STATUS[status] || PAYROLL_MATCH_STATUS.no_calc;
+  const text = status === "drift" || status === "close"
+    ? `${delta >= 0 ? "+" : "−"}${fmt(Math.abs(delta))} · ${m.label}`
+    : m.label;
+  return (
+    <span className="tag" style={{ background: m.color + "20", color: m.color, border: `1px solid ${m.color}40`, fontSize: 10, whiteSpace: "nowrap" }}>
+      {text}
+    </span>
+  );
+}
+
 function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransactions, saveTransactions, tenantId, onChange, showToast }) {
   const [selectedId, setSelectedId] = useState(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -8036,20 +8155,17 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     const checkMs = new Date(t.check_date).getTime();
     const dayMs = 86400000;
     const all = transactions.filter(x => {
-      const amt = parseFloat(x.amount);
-      if (isNaN(amt) || amt >= 0) return false;
-      const desc = (x.description || "").toLowerCase();
-      if (!/paychex|payroll|adp|gusto/.test(desc)) return false;
+      if (!isPayrollBankDebit(x)) return false;
       const xMs = new Date(x.date).getTime();
-      if (Math.abs(xMs - checkMs) > 7 * dayMs) return false;
+      if (Math.abs(xMs - checkMs) > PAYROLL_BANK_WINDOW_DAYS * dayMs) return false;
       if (x.source === "payroll_settlement") return false; // already reconciled
       return true;
     });
     const payroll = [], taxes = [], eib = [];
     for (const row of all) {
-      const desc = (row.description || "").toLowerCase();
-      if (/eib|invoice/.test(desc)) eib.push(row);
-      else if (/tps|taxes/.test(desc)) taxes.push(row);
+      const kind = classifyPayrollBankRow(row);
+      if (kind === "fee") eib.push(row);
+      else if (kind === "taxes") taxes.push(row);
       else payroll.push(row);
     }
     return { payroll, taxes, eib, all };
@@ -8226,6 +8342,17 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   const selected = runs.find(r => r.id === selectedId);
 
+  // Bank vs calculated, per run. Recomputed whenever the ledger or the runs
+  // change, so a statement import flips "awaiting bank" to a real delta
+  // without a refresh.
+  const bankMatch = useMemo(() => matchPayrollRunsToBank(runs, transactions), [runs, transactions]);
+  const matchCounts = useMemo(() => {
+    const c = { match: 0, close: 0, drift: 0, pending: 0, missing: 0, no_calc: 0 };
+    for (const m of bankMatch.values()) c[m.status] = (c[m.status] || 0) + 1;
+    return c;
+  }, [bankMatch]);
+  const selectedMatch = selected ? bankMatch.get(selected.id) : null;
+
   const persist = async (row) => {
     const result = await upsertPayrollRun(row, tenantId);
     if (!result.ok) {
@@ -8386,25 +8513,75 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
         </div>
       </div>
 
+      {!selected && runs.length > 0 && (
+        <div className="card" style={{ marginBottom: 16, padding: "12px 16px", display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap" }}>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Bank vs calculated</div>
+          <div style={{ fontSize: 11, color: "var(--text3)", flex: 1, minWidth: 220 }}>
+            Each run's calculated cost (Favo estimate, or the processor's number from a paystub / Paychex) against the Paychex · ADP · Gusto debits that actually hit the bank within ±{PAYROLL_BANK_WINDOW_DAYS} days of the pay date.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {[
+              ["match", matchCounts.match], ["close", matchCounts.close], ["drift", matchCounts.drift],
+              ["missing", matchCounts.missing], ["pending", matchCounts.pending],
+            ].filter(([, n]) => n > 0).map(([st, n]) => {
+              const m = PAYROLL_MATCH_STATUS[st];
+              return (
+                <span key={st} className="tag" style={{ background: m.color + "20", color: m.color, border: `1px solid ${m.color}40`, fontSize: 10 }}>
+                  {n} {m.label}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {!selected && (
         <div className="card" style={{ padding: 0 }}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>Period</th><th>Pay date</th><th>Status</th><th style={{ textAlign: "right" }}>Employees</th><th style={{ textAlign: "right" }}>Hours</th><th style={{ textAlign: "right" }}>Gross</th><th style={{ textAlign: "right" }}>Total cash out</th></tr></thead>
+              <thead>
+                <tr>
+                  <th>Period</th>
+                  <th>Pay date</th>
+                  <th>Status</th>
+                  <th style={{ textAlign: "right" }}>Emp.</th>
+                  <th style={{ textAlign: "right" }}>Hours</th>
+                  <th style={{ textAlign: "right" }}>Gross</th>
+                  <th style={{ textAlign: "right" }}>Calculated</th>
+                  <th style={{ textAlign: "right" }}>Bank paid</th>
+                  <th style={{ textAlign: "right" }}>Δ bank − calc</th>
+                </tr>
+              </thead>
               <tbody>
                 {runs.length === 0 ? (
-                  <tr><td colSpan={7}><div className="empty"><div className="empty-icon">💵</div><div className="empty-title">No payroll runs yet</div><div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6 }}>Click <strong>New payroll run</strong>, pick the period, and CFO pulls hours from Square automatically.</div></div></td></tr>
-                ) : runs.map(r => (
-                  <tr key={r.id} style={{ cursor: "pointer" }} onClick={() => setSelectedId(r.id)}>
-                    <td className="mono" style={{ color: "var(--text2)" }}>{r.period_start} → {r.period_end}</td>
-                    <td className="mono" style={{ color: "var(--text2)" }}>{r.pay_date || "—"}</td>
-                    <td><span className="tag" style={{ background: statusColor[r.status] + "20", color: statusColor[r.status], border: `1px solid ${statusColor[r.status]}40`, fontSize: 10 }}>{r.status}</span></td>
-                    <td className="text-right mono">{r.totals?.employee_count || 0}</td>
-                    <td className="text-right mono">{(parseFloat(r.totals?.regular_hours) || 0) + (parseFloat(r.totals?.ot_hours) || 0)}h</td>
-                    <td className="text-right mono">{fmt(r.totals?.gross || 0)}</td>
-                    <td className="text-right mono" style={{ color: "var(--yellow)" }}>{fmt(r.totals?.total_cash_out || 0)}</td>
-                  </tr>
-                ))}
+                  <tr><td colSpan={9}><div className="empty"><div className="empty-icon">💵</div><div className="empty-title">No payroll runs yet</div><div style={{ fontSize: 12, color: "var(--text3)", marginTop: 6 }}>Click <strong>New payroll run</strong>, pick the period, and CFO pulls hours from Square automatically.</div></div></td></tr>
+                ) : runs.map(r => {
+                  const m = bankMatch.get(r.id);
+                  const deltaColor = !m || m.delta == null ? "var(--text3)" : PAYROLL_MATCH_STATUS[m.status].color;
+                  return (
+                    <tr key={r.id} style={{ cursor: "pointer" }} onClick={() => setSelectedId(r.id)}>
+                      <td className="mono" style={{ color: "var(--text2)" }}>{r.period_start} → {r.period_end}</td>
+                      <td className="mono" style={{ color: "var(--text2)" }}>{r.pay_date || r.totals?.check_date || "—"}</td>
+                      <td><span className="tag" style={{ background: statusColor[r.status] + "20", color: statusColor[r.status], border: `1px solid ${statusColor[r.status]}40`, fontSize: 10 }}>{r.status}</span></td>
+                      <td className="text-right mono">{r.totals?.employee_count || 0}</td>
+                      <td className="text-right mono">{(parseFloat(r.totals?.regular_hours) || 0) + (parseFloat(r.totals?.ot_hours) || 0)}h</td>
+                      <td className="text-right mono">{fmt(r.totals?.gross || 0)}</td>
+                      <td className="text-right mono" style={{ color: "var(--yellow)" }}>
+                        {m?.calculated != null ? fmt(m.calculated) : "—"}
+                        {m?.calcSource && <div style={{ fontSize: 9, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{m.calcSource}</div>}
+                      </td>
+                      <td className="text-right mono">
+                        {m?.hasBank ? fmt(m.bankPaid) : <span style={{ color: "var(--text3)" }}>—</span>}
+                        {m?.hasBank && m.bankFee > 0 && <div style={{ fontSize: 9, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>+ fee {fmt(m.bankFee)}</div>}
+                      </td>
+                      <td className="text-right mono" style={{ color: deltaColor }}>
+                        {m?.delta != null
+                          ? <>{m.delta >= 0 ? "+" : "−"}{fmt(Math.abs(m.delta))}<div style={{ fontSize: 9, fontFamily: "var(--font-mono)" }}>{m.deltaPct >= 0 ? "+" : ""}{m.deltaPct.toFixed(1)}%</div></>
+                          : <span style={{ fontSize: 10, color: "var(--text3)" }}>{m ? PAYROLL_MATCH_STATUS[m.status].label : "—"}</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -8455,6 +8632,8 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
               ))}
             </div>
           </div>
+
+          <PayrollBankCompare run={selected} match={selectedMatch} />
 
           <div className="card" style={{ padding: 0 }}>
             <div className="table-wrap">
@@ -8534,6 +8713,121 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
           onSave={savePaystubAsRun}
         />
       )}
+    </div>
+  );
+}
+
+function PayrollBankCompare({ run, match }) {
+  if (!run) return null;
+  const t = run.totals || {};
+  const m = match || { rows: { payroll: [], taxes: [], fee: [] }, hasBank: false, status: "pending", favoEstimate: round2(t.total_cash_out), processorCalc: round2(t.total_bank_debit), processorLabel: "Processor", calculated: null, calcSource: null, delta: null, deltaPct: null, bankPaid: 0, bankFee: 0, anchor: payrollRunAnchorDate(run) };
+  const st = PAYROLL_MATCH_STATUS[m.status] || PAYROLL_MATCH_STATUS.no_calc;
+  const hasFavo = m.favoEstimate > 0;
+  const hasProc = m.processorCalc > 0;
+  const bankRows = [...m.rows.payroll, ...m.rows.taxes, ...m.rows.fee].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  // Calibration: Favo assumes PAYROLL_EMPLOYER_BURDEN on gross. When the
+  // processor's number is here we can see the real employer match and say
+  // how far the assumption is off — that is what makes next month's estimate
+  // better.
+  const procGross = round2((parseFloat(t.wages_subtotal) || 0) + (parseFloat(t.tips_charged) || 0));
+  const actualBurdenPct = procGross > 0 ? ((parseFloat(t.employer_match_total) || 0) / procGross) * 100 : null;
+  const favoVsProc = hasFavo && hasProc ? round2(m.processorCalc - m.favoEstimate) : null;
+
+  const kpi = (label, value, sub, color) => (
+    <div style={{ background: "var(--surface2)", padding: "10px 14px", borderRadius: "var(--radius2)", minWidth: 0 }}>
+      <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+      <div className="mono" style={{ fontSize: 16, marginTop: 4, color: color || "var(--text)" }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 2, fontFamily: "var(--font-mono)" }}>{sub}</div>}
+    </div>
+  );
+  const line = (label, value, opts = {}) => (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px dotted var(--border)" }}>
+      <span style={{ fontSize: 12, color: opts.dim ? "var(--text3)" : "var(--text2)" }}>{label}</span>
+      <span className="mono" style={{ fontSize: 12, color: opts.color || "var(--text)", fontWeight: opts.bold ? 700 : 400 }}>{typeof value === "number" ? fmt(value) : value}</span>
+    </div>
+  );
+  const kindLabel = { payroll: "PAYROLL", taxes: "TAXES", fee: "FEE" };
+  const kindColor = { payroll: "var(--accent)", taxes: "var(--blue)", fee: "var(--text3)" };
+
+  return (
+    <div className="card" style={{ marginBottom: 16, borderLeft: `3px solid ${st.color}` }}>
+      <div className="flex items-center justify-between" style={{ marginBottom: 12 }}>
+        <div>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Bank vs calculated</div>
+          <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
+            Debits matching Paychex · ADP · Gusto within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor || "the pay date"}. The processor's fee is shown apart — it is not payroll.
+          </div>
+        </div>
+        <PayrollMatchTag status={m.status} delta={m.delta} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+        {kpi("Favo estimate", hasFavo ? fmt(m.favoEstimate) : "—", hasFavo ? `Square hours · +${(PAYROLL_EMPLOYER_BURDEN * 100).toFixed(0)}% burden` : "no Square lines")}
+        {kpi(m.processorLabel, hasProc ? fmt(m.processorCalc) : "—", hasProc ? "what the processor will pull" : "import a paystub PDF", hasProc ? "var(--yellow)" : undefined)}
+        {kpi("Bank paid", m.hasBank ? fmt(m.bankPaid) : "—", m.hasBank ? `${m.rows.payroll.length + m.rows.taxes.length} debit${m.rows.payroll.length + m.rows.taxes.length === 1 ? "" : "s"}${m.bankFee > 0 ? ` · fee ${fmt(m.bankFee)}` : ""}` : st.label)}
+        {kpi("Δ bank − calc", m.delta != null ? `${m.delta >= 0 ? "+" : "−"}${fmt(Math.abs(m.delta))}` : "—", m.delta != null ? `${m.deltaPct >= 0 ? "+" : ""}${m.deltaPct.toFixed(1)}% vs ${m.calcSource}` : (m.calcSource ? `vs ${m.calcSource}` : "nothing to compare"), m.delta != null ? st.color : undefined)}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+        <div>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 12, marginBottom: 6, color: "var(--accent)" }}>Calculated</div>
+          {hasProc ? (
+            <>
+              {line("Wages (hourly + OT)", parseFloat(t.wages_subtotal) || 0)}
+              {line("Tips charged (pass-through)", parseFloat(t.tips_charged) || 0, { color: "var(--purple)" })}
+              {line("Reimbursements (non-tax)", parseFloat(t.reimb_non_tax) || 0, { color: "var(--blue)" })}
+              {line("Employer match (SS · Medicare · FUTA · SUTA)", parseFloat(t.employer_match_total) || 0)}
+              {line(`${m.processorLabel} total bank debit`, m.processorCalc, { bold: true, color: "var(--yellow)" })}
+            </>
+          ) : hasFavo ? (
+            <>
+              {line("Gross (wages + bonus + tips)", parseFloat(t.gross) || 0)}
+              {line(`Employer burden · ${(PAYROLL_EMPLOYER_BURDEN * 100).toFixed(0)}% assumed`, parseFloat(t.employer_tax) || 0)}
+              {line("Favo estimated cash out", m.favoEstimate, { bold: true, color: "var(--yellow)" })}
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: "var(--text3)" }}>Nothing calculated yet — build the run from Square hours or import a paystub PDF.</div>
+          )}
+          {hasFavo && hasProc && (
+            <div style={{ marginTop: 10, padding: "8px 10px", background: "var(--surface2)", borderRadius: "var(--radius2)", fontSize: 11, color: "var(--text2)", lineHeight: 1.5 }}>
+              <strong>Calibration.</strong> {m.processorLabel} came in {favoVsProc >= 0 ? "+" : "−"}{fmt(Math.abs(favoVsProc))} vs Favo's estimate.
+              {actualBurdenPct != null && (
+                <> Actual employer burden <span className="mono" style={{ color: Math.abs(actualBurdenPct - PAYROLL_EMPLOYER_BURDEN * 100) > 3 ? "var(--yellow)" : "var(--accent)" }}>{actualBurdenPct.toFixed(1)}%</span> of gross vs {(PAYROLL_EMPLOYER_BURDEN * 100).toFixed(0)}% assumed.</>
+              )}
+              {Math.abs(favoVsProc) > 0 && (parseFloat(t.tips_charged) || 0) + (parseFloat(t.reimb_non_tax) || 0) > 0 && (
+                <> Tips and reimbursements ride the same ACH but are not labor cost.</>
+              )}
+            </div>
+          )}
+        </div>
+        <div>
+          <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 12, marginBottom: 6, color: "var(--accent)" }}>Bank</div>
+          {bankRows.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--text3)", lineHeight: 1.5 }}>
+              {m.status === "missing"
+                ? <>No payroll debit landed within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor}. Import the bank statement or run <strong>Sync Bank</strong>; if it is there under another name, the description needs "Paychex", "ADP", "Gusto" or "Payroll" to be picked up.</>
+                : <>Pay date {m.anchor || "not set"} — the debit has not reached the ledger yet.</>}
+            </div>
+          ) : (
+            <>
+              {bankRows.map(r => {
+                const kind = classifyPayrollBankRow(r);
+                return (
+                  <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: "1px dotted var(--border)" }}>
+                    <span className="mono" style={{ fontSize: 11, color: "var(--text3)", flexShrink: 0 }}>{fmtShort(r.date)}</span>
+                    <span style={{ fontSize: 11, color: "var(--text2)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.description}>{r.description}</span>
+                    <span className="tag" style={{ fontSize: 9, background: kindColor[kind] + "20", color: kindColor[kind], border: `1px solid ${kindColor[kind]}40`, flexShrink: 0 }}>{kindLabel[kind]}</span>
+                    <span className="mono" style={{ fontSize: 12, flexShrink: 0, color: kind === "fee" ? "var(--text3)" : "var(--text)" }}>{fmt(Math.abs(parseFloat(r.amount) || 0))}</span>
+                  </div>
+                );
+              })}
+              {line("Bank paid (payroll + taxes)", m.bankPaid, { bold: true })}
+              {m.bankFee > 0 && line("Processor fee (not payroll)", m.bankFee, { dim: true })}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
