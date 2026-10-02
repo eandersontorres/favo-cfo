@@ -484,29 +484,76 @@ export async function fetchPurchaseAllocation(purchaseId, tenantId) {
   if (!purchaseId || tid === 'demo') return []
 
   const { data: pur, error: pErr } = await supabase
-    .from('r7_purchases').select('id, items').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
+    .from('r7_purchases').select('id, supplier, items').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
   if (pErr || !pur) { if (pErr) console.error('fetchPurchaseAllocation/purchase', pErr); return [] }
 
   const all = await fetchPurchaseAllocations([pur], tid)
   return all.get(String(pur.id)) || []
 }
 
-/**
- * Same breakdown for MANY purchases in three queries instead of three per
- * purchase. Sync Kitchen runs this over every invoice in the date range (75 in
- * a month at TorresBee), so the per-purchase version would be 225 round trips.
- *
- * @param purchases rows from r7_purchases that carry `items` (fetchKitchenPurchases
- *   selects *, so they do)
- * @returns {Promise<Map<string, Array<{categoryId, amount}>>>} keyed by purchase id.
- *   A purchase with no usable line items is absent from the map -- the caller
- *   falls back to the single-category shadow, exactly as before.
- */
-export async function fetchPurchaseAllocations(purchases, tenantId) {
-  const tid = tenantId || TENANT()
-  const out = new Map()
-  if (tid === 'demo' || !purchases || purchases.length === 0) return out
+// ─── ITEM → ACCOUNT RESOLUTION ───────────────────────────────────────────────
+// Three sources decide which ledger account an invoice line belongs to, in
+// this order:
+//   1. a CFO item rule (r7_ledger_item_rules) -- the operator said so, once,
+//      in the invoice panel; vendor-specific beats global
+//   2. the Kitchen path: item → r7_items.catId → r7_ledger_kitchen_category_map
+//   3. nothing → null, which becomes an UNCATEGORIZED child
+// Rules come first because they exist precisely for the lines the Kitchen
+// path cannot resolve, and because an explicit decision outranks a mapping.
 
+// Normalisation is deliberately dumb: uppercase, letters/digits/space only,
+// collapsed whitespace. "Black Pepper" and "BLACK PEPPER 16OZ" are different
+// keys. When a key does not match the line goes back to Uncategorized and the
+// operator clicks again -- better than a fuzzy rule that is wrong in silence.
+export function normalizeItemKey(name) {
+  return String(name || '').toUpperCase().replace(/[^A-Z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+export function normalizeVendorKey(name) {
+  return normalizeItemKey(name)
+}
+const ruleKey = (vendorKey, itemKey) => `${vendorKey || ''}|${itemKey}`
+
+export async function fetchItemRules(tenantId) {
+  const tid = tenantId || TENANT()
+  if (tid === 'demo') return []
+  const { data, error } = await supabase
+    .from('r7_ledger_item_rules').select('item_key, vendor_key, ledger_account_id').eq('tenant_id', tid)
+  if (error) { console.error('fetchItemRules', error); return [] }
+  return data || []
+}
+
+export async function upsertItemRule({ itemName, vendorName = null, ledgerAccountId }, tenantId) {
+  const tid = tenantId || TENANT()
+  if (tid === 'demo') return { ok: true, demo: true }
+  const row = {
+    tenant_id: tid,
+    item_key: normalizeItemKey(itemName),
+    vendor_key: vendorName ? normalizeVendorKey(vendorName) : '',
+    ledger_account_id: ledgerAccountId,
+  }
+  if (!row.item_key || !row.ledger_account_id) return { ok: false, error: 'item name and account are required' }
+  const { error } = await supabase
+    .from('r7_ledger_item_rules').upsert(row, { onConflict: 'tenant_id,item_key,vendor_key' })
+  if (error) { console.error('upsertItemRule', error); return { ok: false, error: error.message } }
+  return { ok: true, row }
+}
+
+// A Kitchen category the operator maps from the invoice panel. One entry
+// settles every item in that category, on every invoice, from now on.
+export async function upsertKitchenCategoryMap(kitchenCategoryId, ledgerAccountId, tenantId) {
+  const tid = tenantId || TENANT()
+  if (tid === 'demo') return { ok: true, demo: true }
+  if (!kitchenCategoryId || !ledgerAccountId) return { ok: false, error: 'category and account are required' }
+  const { error } = await supabase
+    .from('r7_ledger_kitchen_category_map')
+    .upsert({ tenant_id: tid, kitchen_category_id: String(kitchenCategoryId), ledger_account_id: ledgerAccountId },
+            { onConflict: 'tenant_id,kitchen_category_id' })
+  if (error) { console.error('upsertKitchenCategoryMap', error); return { ok: false, error: error.message } }
+  return { ok: true }
+}
+
+// Everything the resolver needs, fetched once for a batch of purchases.
+async function loadResolutionContext(purchases, tid) {
   const itemsByPurchase = new Map()
   const mappedIds = new Set()
   for (const p of purchases) {
@@ -515,7 +562,6 @@ export async function fetchPurchaseAllocations(purchases, tenantId) {
     itemsByPurchase.set(String(p.id), items)
     for (const it of items) if (it?._mappedItemId) mappedIds.add(String(it._mappedItemId))
   }
-  if (itemsByPurchase.size === 0) return out
 
   const catByItem = new Map()
   const ids = [...mappedIds]
@@ -524,32 +570,129 @@ export async function fetchPurchaseAllocations(purchases, tenantId) {
   for (let i = 0; i < ids.length; i += 200) {
     const { data: rows, error } = await supabase
       .from('r7_items').select('id, catId').eq('tenant_id', tid).in('id', ids.slice(i, i + 200))
-    if (error) { console.error('fetchPurchaseAllocations/items', error); continue }
+    if (error) { console.error('loadResolutionContext/items', error); continue }
     for (const r of (rows || [])) catByItem.set(String(r.id), r.catId == null ? null : String(r.catId))
   }
 
   const { data: mapRows, error: mErr } = await supabase
     .from('r7_ledger_kitchen_category_map')
     .select('kitchen_category_id, ledger_account_id').eq('tenant_id', tid)
-  if (mErr) console.error('fetchPurchaseAllocations/map', mErr)
+  if (mErr) console.error('loadResolutionContext/map', mErr)
   const acctByCat = new Map((mapRows || []).map(r => [String(r.kitchen_category_id), r.ledger_account_id]))
 
-  for (const [pid, items] of itemsByPurchase) {
-    const buckets = new Map()
-    for (const it of items) {
-      const v = lineValue(it)
-      if (v === 0) continue
-      const kcat = catByItem.get(String(it?._mappedItemId ?? ''))
-      const acct = kcat ? (acctByCat.get(kcat) || null) : null
-      buckets.set(acct, (buckets.get(acct) || 0) + v)
-    }
-    const list = [...buckets.entries()]
-      .map(([categoryId, amount]) => ({ categoryId, amount }))
-      .filter(b => Math.abs(b.amount) > 0.0001)
-      .sort((a, b) => b.amount - a.amount)
+  const rules = new Map((await fetchItemRules(tid)).map(r => [ruleKey(r.vendor_key, r.item_key), r.ledger_account_id]))
+
+  return { itemsByPurchase, catByItem, acctByCat, rules }
+}
+
+// One invoice line → { accountId, kitchenCatId, resolvedBy }.
+export function resolveLineAccount(line, vendorName, ctx) {
+  const itemKey = normalizeItemKey(line?.name)
+  const vendorKey = normalizeVendorKey(vendorName)
+  if (itemKey) {
+    const specific = ctx.rules.get(ruleKey(vendorKey, itemKey))
+    if (specific) return { accountId: specific, kitchenCatId: null, resolvedBy: 'rule' }
+    const global = ctx.rules.get(ruleKey('', itemKey))
+    if (global) return { accountId: global, kitchenCatId: null, resolvedBy: 'rule' }
+  }
+  const kcat = line?._mappedItemId ? (ctx.catByItem.get(String(line._mappedItemId)) ?? null) : null
+  if (kcat) {
+    const acct = ctx.acctByCat.get(kcat) || null
+    return { accountId: acct, kitchenCatId: kcat, resolvedBy: acct ? 'kitchen' : null }
+  }
+  return { accountId: null, kitchenCatId: null, resolvedBy: null }
+}
+
+// Sum lines into { categoryId, amount } buckets, descending.
+export function bucketsFromLines(lines) {
+  const buckets = new Map()
+  for (const l of lines) {
+    const v = parseFloat(l.landed) || 0
+    if (v === 0) continue
+    buckets.set(l.accountId || null, (buckets.get(l.accountId || null) || 0) + v)
+  }
+  return [...buckets.entries()]
+    .map(([categoryId, amount]) => ({ categoryId, amount }))
+    .filter(b => Math.abs(b.amount) > 0.0001)
+    .sort((a, b) => b.amount - a.amount)
+}
+
+/**
+ * Per-account breakdown for MANY purchases in four queries instead of four per
+ * purchase. Sync Kitchen runs this over every invoice in the date range (75 in
+ * a month at TorresBee).
+ *
+ * @param purchases rows from r7_purchases that carry `items` and `supplier`
+ *   (fetchKitchenPurchases selects *, so they do)
+ * @returns {Promise<Map<string, Array<{categoryId, amount}>>>} keyed by purchase id.
+ *   A purchase with no usable line items is absent from the map -- the caller
+ *   falls back to the single-category shadow.
+ */
+export async function fetchPurchaseAllocations(purchases, tenantId) {
+  const tid = tenantId || TENANT()
+  const out = new Map()
+  if (tid === 'demo' || !purchases || purchases.length === 0) return out
+
+  const ctx = await loadResolutionContext(purchases, tid)
+  if (ctx.itemsByPurchase.size === 0) return out
+
+  const vendorById = new Map(purchases.map(p => [String(p.id), p.supplier || '']))
+  for (const [pid, items] of ctx.itemsByPurchase) {
+    const lines = items.map(it => ({ landed: lineValue(it), ...resolveLineAccount(it, vendorById.get(pid), ctx) }))
+    const list = bucketsFromLines(lines)
     if (list.length > 0) out.set(pid, list)
   }
   return out
+}
+
+/**
+ * The invoice as the operator sees it in the Transactions panel: every line
+ * with its Kitchen category (name included) and the ledger account the
+ * resolver lands on, plus why. Also returns the purchase header so the panel
+ * can re-split the shadow without a second round trip.
+ */
+export async function fetchPurchaseLines(purchaseId, tenantId) {
+  const tid = tenantId || TENANT()
+  if (!purchaseId || tid === 'demo') return null
+
+  const { data: pur, error: pErr } = await supabase
+    .from('r7_purchases').select('id, date, supplier, total, items, invoice_path').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
+  if (pErr || !pur) { if (pErr) console.error('fetchPurchaseLines/purchase', pErr); return null }
+
+  const ctx = await loadResolutionContext([pur], tid)
+  const items = ctx.itemsByPurchase.get(String(pur.id)) || []
+
+  const catIds = [...new Set([...ctx.catByItem.values()].filter(Boolean))]
+  const catNames = new Map()
+  if (catIds.length > 0) {
+    const { data: cats, error } = await supabase
+      .from('r7_categories').select('id, name').eq('tenant_id', tid).in('id', catIds)
+    if (error) console.error('fetchPurchaseLines/categories', error)
+    for (const c of (cats || [])) catNames.set(String(c.id), String(c.name || '').trim())
+  }
+
+  const lines = items.map((it, idx) => {
+    const r = resolveLineAccount(it, pur.supplier, ctx)
+    const mapped = it?._mappedItemId ? String(it._mappedItemId) : null
+    const kcat = mapped ? (ctx.catByItem.get(mapped) ?? null) : null
+    return {
+      idx,
+      name: String(it?.name || '').trim() || '(unnamed line)',
+      qty: parseFloat(it?.qty) || 0,
+      unit: it?.unit || '',
+      landed: lineValue(it),
+      mappedItemId: mapped,
+      kitchenCatId: kcat,
+      kitchenCatName: kcat ? (catNames.get(kcat) || kcat) : null,
+      accountId: r.accountId,
+      resolvedBy: r.resolvedBy,
+    }
+  })
+
+  return {
+    purchase: { id: String(pur.id), date: pur.date, supplier: pur.supplier || '', total: parseFloat(pur.total) || 0, invoice_path: pur.invoice_path || null },
+    lines,
+  }
 }
 
 /**
@@ -1159,55 +1302,99 @@ export async function fetchMarketingSpend(tenantId, { start, end } = {}) {
 // Children reuse source='kitchen_purchase' on purpose: every rule that keeps
 // the shadow out of cash flow, out of the bill matcher and out of the
 // "needs a receipt" list applies to them unchanged. They are told apart from
-// the parent by parent_id alone. Ids are deterministic so re-syncing the same
-// invoice upserts instead of duplicating.
+// the parent by parent_id alone.
 //
-// A line item Kitchen has not categorised lands in an UNCATEGORIZED child. It
-// shows up in the Transactions review tab and asks for a decision; guessing
-// "food" would hide the gap it is there to expose.
+// Child ids are keyed by ACCOUNT, not by position: kitchen_purchase_<pid>_alloc_<account id|uncat>.
+// The breakdown changes after the fact (an item gets a rule, a Kitchen
+// category gets mapped) and a positional id would then point at a different
+// slice -- re-syncing would overwrite the food child with the cleaning amount.
+// Keyed by account, a re-split upserts the shares that still exist and deletes
+// the ones that no longer do (see reconcileShadowChildren).
+//
+// A line nothing resolves lands in an UNCATEGORIZED child. It shows up in the
+// Transactions review tab and asks for a decision; guessing "food" would hide
+// the gap it is there to expose.
+export function buildKitchenShadowRows(p, vendor, foodBevCategoryId, buckets) {
+  const parentId = 'kitchen_purchase_' + p.id
+  const total = -(parseFloat(p.total) || 0)
+  const shares = prorateAllocation(buckets || [], Math.abs(total))
+  // Single-bucket invoice: no children, but the parent takes that account
+  // when Kitchen knows it. An invoice whose items are all unresolved keeps
+  // the default, so one scanned before item mapping existed behaves as before.
+  const lead = shares.length >= 2 ? shares[0] : (buckets || [])[0]
+  const parentCat = (lead && lead.categoryId) || foodBevCategoryId || null
+  const parent = {
+    id: parentId,
+    date: p.date,
+    description: String(vendor).toUpperCase(),
+    amount: total,
+    category_id: parentCat,
+    category: parentCat || UNCATEGORIZED,
+    account: 'Kitchen Sync',
+    reconciled: false,
+    source: 'kitchen_purchase',
+    notes: p.invoice_path ? 'Invoice: ' + p.invoice_path : '',
+  }
+  if (shares.length < 2) return [parent]
+  const children = shares.map(sh => ({
+    id: `${parentId}_alloc_${sh.categoryId || 'uncat'}`,
+    parent_id: parentId,
+    date: p.date,
+    description: parent.description,
+    amount: -Math.abs(sh.amount),
+    category_id: sh.categoryId || null,
+    category: sh.categoryId || UNCATEGORIZED,
+    account: 'Kitchen Sync',
+    reconciled: false,
+    source: 'kitchen_purchase',
+    notes: sh.categoryId ? 'Line items from Kitchen invoice' : 'Line items nothing categorises yet — open the row to assign',
+  }))
+  // Parent first: parent_id is a foreign key onto the same table.
+  return [parent, ...children]
+}
+
 export function purchasesToTransactions(purchases, vendorMap = {}, foodBevCategoryId, allocations = null) {
   return purchases.flatMap(p => {
     // r7_purchases stores the supplier name inline AND a vendorId FK; prefer
     // the inline supplier (always populated by Kitchen's invoice scanner),
     // fall back to vendorMap lookup, then to a generic label.
     const vendor = p.supplier || vendorMap[p.vendorId] || vendorMap[p.vendor_id] || 'VENDOR PURCHASE';
-    const parentId = 'kitchen_purchase_' + p.id
-    const total = -(parseFloat(p.total) || 0)
-    const buckets = allocations?.get?.(String(p.id)) || []
-    const shares = prorateAllocation(buckets, Math.abs(total))
-    // Single-bucket invoice: no children, but the parent takes that account
-    // when Kitchen knows it. An invoice whose items are all unmapped keeps the
-    // default, so one scanned before item mapping existed behaves as before.
-    const lead = shares.length >= 2 ? shares[0] : buckets[0]
-    const parentCat = (lead && lead.categoryId) || foodBevCategoryId || null
-    const parent = {
-      id: parentId,
-      date: p.date,
-      description: String(vendor).toUpperCase(),
-      amount: total,
-      category_id: parentCat,
-      category: parentCat || UNCATEGORIZED,
-      account: 'Kitchen Sync',
-      reconciled: false,
-      source: 'kitchen_purchase',
-      notes: p.invoice_path ? 'Invoice: ' + p.invoice_path : '',
-    };
-    if (shares.length < 2) return [parent]
-    const children = shares.map((sh, n) => ({
-      id: `${parentId}_alloc_${n}`,
-      parent_id: parentId,
-      date: p.date,
-      description: parent.description,
-      amount: -Math.abs(sh.amount),
-      category_id: sh.categoryId || null,
-      category: sh.categoryId || UNCATEGORIZED,
-      account: 'Kitchen Sync',
-      reconciled: false,
-      source: 'kitchen_purchase',
-      notes: sh.categoryId ? 'Line items from Kitchen invoice' : 'Line items Kitchen has not categorised yet',
-    }))
-    // Parent first: parent_id is a foreign key onto the same table.
-    return [parent, ...children]
+    return buildKitchenShadowRows(p, vendor, foodBevCategoryId, allocations?.get?.(String(p.id)) || [])
   })
+}
+
+// Which children to write and which to delete so a parent's split matches a
+// freshly computed breakdown. Pure, so the sync and the invoice panel share it.
+//
+// One thing is preserved: a category the operator set by hand on a child that
+// the new breakdown still leaves unresolved. They already did the work in the
+// dropdown; a re-sync must not reset it to Uncategorized. (If the breakdown
+// resolves the slice instead, the uncat child is deleted and the account's
+// child created -- same money, better provenance.)
+export function reconcileShadowChildren(desiredChildren, existingChildren) {
+  const desiredIds = new Set(desiredChildren.map(c => c.id))
+  const existingById = new Map((existingChildren || []).map(c => [c.id, c]))
+  const toUpsert = desiredChildren.map(c => {
+    const prev = existingById.get(c.id)
+    const manualCat = prev && !c.category_id && prev.category && prev.category !== UNCATEGORIZED ? prev.category : null
+    return manualCat ? { ...c, category_id: manualCat, category: manualCat } : c
+  })
+  const toDelete = (existingChildren || []).filter(c => !desiredIds.has(c.id)).map(c => c.id)
+  return { toUpsert, toDelete }
+}
+
+// Write a parent + its reconciled children, delete the stale ones. Parent goes
+// in the same upsert as the children (parent_id is an FK onto the table);
+// deletes run after so a child never dangles.
+export async function applyKitchenShadow(parent, toUpsert, toDelete, tenantId) {
+  const tid = tenantId || TENANT()
+  if (tid === 'demo') return { ok: true, demo: true }
+  const up = await upsertTransactions([parent, ...toUpsert], tid)
+  if (!up.ok) return up
+  if (toDelete.length > 0) {
+    const { error } = await supabase.from('r7_ledger_transactions').delete().in('id', toDelete).eq('tenant_id', tid)
+    if (error) { console.error('applyKitchenShadow/delete', error); return { ok: false, error: error.message } }
+  }
+  return { ok: true }
 }
 
