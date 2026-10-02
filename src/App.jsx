@@ -672,7 +672,11 @@ function accrualDate(t) {
 //   - aggregator_settlement → DoorDash/UberEats/GrubHub/Wix net deposits
 //                              (gross is already in Square Net Sales as Other tender)
 //   - internal_transfer     → bank-to-bank moves between own accounts
-const NON_REVENUE_SOURCES = new Set(["internal_transfer", "square_settlement", "aggregator_settlement"]);
+//   - payroll_settlement    → the bank legs of a payroll run (processor ACH,
+//                              paper checks) once the paystub booked the
+//                              period's labor; the paystub_shadow rows are
+//                              what the P&L counts
+const NON_REVENUE_SOURCES = new Set(["internal_transfer", "square_settlement", "aggregator_settlement", "payroll_settlement"]);
 function isRevenueRelevant(t) {
   return t && !NON_REVENUE_SOURCES.has(t.source);
 }
@@ -4389,7 +4393,7 @@ const CASHFLOW_NON_CASH  = /^(deprecia|amortiza)/i;
 const CASHFLOW_CARDISH = /credit|card|cart(ã|a)o|visa|mastercard|amex/i;
 const CASHFLOW_NON_BANK_SOURCES = new Set([
   "square_net_sales", "square_sales_tax", "square_tips", "square_fee", "square_service_charges",
-  "kitchen_purchase", "kitchen_split_retro", "aggregator_accrual", "pl_import",
+  "kitchen_purchase", "kitchen_split_retro", "aggregator_accrual", "pl_import", "paystub_shadow",
 ]);
 
 function cashflowSection(catName) {
@@ -8266,16 +8270,25 @@ function exportPayrollCSV(run) {
 //   - the ledger               Paychex / ADP / Gusto ACH debits near the pay date
 // The screen lines the three up so a drift shows the day the bank row lands,
 // not at Schedule C time.
-const PAYROLL_BANK_WINDOW_DAYS = 7;
+const PAYROLL_BANK_WINDOW_DAYS = 7;                  // processor ACH legs land within days of the check date
+const PAYROLL_CHECK_WINDOW = { before: 1, after: 21 }; // paper checks are cashed when the employee gets to the bank
 const PAYROLL_BANK_DESC_RE = /paychex|payroll|adp|gusto/i;
+const PAYROLL_CHECK_DESC_RE = /^check\s*#?\s*\d+/i;
 // Rows CFO itself wrote into the ledger (submitRun shadow, paystub shadows).
 // Their descriptions say "PAYROLL", so the regex alone would count them as
 // money the bank moved.
 const PAYROLL_SYNTHETIC_SOURCES = new Set(["payroll_run", "paystub_shadow"]);
 const PAYROLL_CALC_SOURCE_LABEL = { paystub_pdf: "Paystub PDF", paychex_api: "Paychex" };
+// A settled bank leg carries the run it settled, so a re-run and the card can
+// tell "this check is already ours" from "this check is still a candidate".
+const PAYROLL_SETTLEMENT_TAG = "payroll_settlement:";
+function settlementRunOf(t) {
+  const tag = (Array.isArray(t?.tags) ? t.tags : []).find(x => typeof x === "string" && x.startsWith(PAYROLL_SETTLEMENT_TAG));
+  return tag ? tag.slice(PAYROLL_SETTLEMENT_TAG.length) : null;
+}
 
-// Paychex splits one pay period into 2-3 bank rows: PAYROLL (direct deposits),
-// TAXES / TPS (withholdings + employer match) and EIB INVOICE (its own fee).
+// Description-only classifier, for runs that have no paystub (Favo estimate)
+// and for banks that spell the legs out (PAYROLL / TPS TAXES / EIB INVOICE).
 function classifyPayrollBankRow(t) {
   const desc = (t.description || "").toLowerCase();
   if (/eib|invoice/.test(desc)) return "fee";
@@ -8290,44 +8303,141 @@ function isPayrollBankDebit(t) {
   return PAYROLL_BANK_DESC_RE.test(t.description || "");
 }
 
+// A paper check that could be an employee's pay: negative, "CHECK nnn", and
+// not already filed as some other expense. Uncategorized, a transfer-type
+// category (Plaid used to file checks as "account transfer") or the Payroll
+// category itself all qualify; a check matched to a vendor invoice does not.
+function isPayrollCheckCandidate(t, ctx = {}) {
+  if (PAYROLL_SYNTHETIC_SOURCES.has(t.source)) return false;
+  const amt = parseFloat(t.amount);
+  if (isNaN(amt) || amt >= 0) return false;
+  if (!PAYROLL_CHECK_DESC_RE.test(t.description || "")) return false;
+  const cat = t.category && t.category !== UNCATEGORIZED ? t.category : null;
+  if (!cat) return true;
+  if (ctx.payrollCatId && cat === ctx.payrollCatId) return true;
+  return !!(ctx.transferCatIds && ctx.transferCatIds.has(cat));
+}
+
 // The date the processor actually hits the bank: paystub check date first,
 // then the pay date the operator typed, then period end as a last resort.
 function payrollRunAnchorDate(run) {
   return run?.totals?.check_date || run?.pay_date || run?.period_end || null;
 }
+// Where the period's labor lands in the P&L: the end of the period worked,
+// so September's labor sits next to September's revenue even when Paychex
+// pays it on 10/05. Anderson's call, 02/10/2026.
+function payrollRunShadowDate(run) {
+  return run?.period_end || run?.totals?.check_date || run?.pay_date || null;
+}
+function runHasPaystub(run) {
+  return (parseFloat(run?.totals?.total_bank_debit) || 0) > 0;
+}
 
-// Assign every payroll-looking bank debit to the run whose anchor date is
-// nearest, within ±PAYROLL_BANK_WINDOW_DAYS. Nearest-wins, so a debit sitting
-// between two biweekly runs is counted once, never on both.
-// Returns Map<runId, comparison>.
-function matchPayrollRunsToBank(runs, transactions) {
+// Bank of America prints every Paychex leg as plain "PAYCHEX", so the legs are
+// told apart by AMOUNT against the paystub: the one equal to the tax liability
+// is the tax remittance, anything small is the service fee, the big remainder
+// is the direct-deposit batch. Falls back to the description classifier when
+// there is no paystub to compare against.
+function classifyProcessorLegs(rows, totals) {
+  const out = { taxes: [], payroll: [], fee: [] };
+  const taxLiab = parseFloat(totals?.total_tax_liability) || 0;
+  const netPay = parseFloat(totals?.net_pay) || 0;
+  if (!(taxLiab > 0) && !(netPay > 0)) {
+    for (const r of rows) out[classifyPayrollBankRow(r)].push(r);
+    return out;
+  }
+  const feeCeiling = Math.max(300, netPay * 0.02);
+  const sorted = [...rows].sort((a, b) => Math.abs(parseFloat(b.amount)) - Math.abs(parseFloat(a.amount)));
+  let taxTaken = false;
+  for (const r of sorted) {
+    const amt = Math.abs(parseFloat(r.amount) || 0);
+    const kind = classifyPayrollBankRow(r);
+    if (!taxTaken && taxLiab > 0 && Math.abs(amt - taxLiab) <= 1) { out.taxes.push(r); taxTaken = true; continue; }
+    if (kind === "fee" || amt <= feeCeiling) { out.fee.push(r); continue; }
+    if (kind === "taxes" && !taxTaken) { out.taxes.push(r); taxTaken = true; continue; }
+    out.payroll.push(r);
+  }
+  return out;
+}
+
+// Which checks belong to the run: the ones already settled to it always; the
+// rest in cleared order while the running total stays within the paystub's
+// check total (net pay − direct deposit). What does not fit is listed as
+// skipped, not silently dropped, and the gap to the expected total is the
+// "outstanding" the card shows -- an employee who has not cashed a check yet.
+function pickPayrollChecks(candidates, expected, runId) {
+  const settled = candidates.filter(c => settlementRunOf(c) === runId);
+  const open = candidates.filter(c => settlementRunOf(c) !== runId)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)) || Math.abs(parseFloat(b.amount)) - Math.abs(parseFloat(a.amount)));
+  const taken = [...settled];
+  const skipped = [];
+  let sum = settled.reduce((s, c) => s + Math.abs(parseFloat(c.amount) || 0), 0);
+  for (const c of open) {
+    const amt = Math.abs(parseFloat(c.amount) || 0);
+    if (expected != null && sum + amt <= expected + 1) { taken.push(c); sum += amt; }
+    else skipped.push(c);
+  }
+  return { taken, skipped, sum: round2(sum) };
+}
+
+// Assign every payroll-looking bank row to a run and plan each run's
+// settlement. Processor ACH rows go to the run whose check date is nearest
+// within ±PAYROLL_BANK_WINDOW_DAYS; checks to the nearest check date in
+// [−1, +21] days, paystub runs only (a Favo estimate has no check total to
+// fit them to). A row already tagged to a run stays with that run whatever
+// the dates say. Nearest-wins, so a debit between two biweekly runs is
+// counted once, never on both.
+// Returns Map<runId, plan>.
+function matchPayrollRunsToBank(runs, transactions, ctx = {}) {
   const dayMs = 86400000;
   const anchors = (runs || [])
     .filter(r => r.status !== "cancelled" && payrollRunAnchorDate(r))
-    .map(r => ({ run: r, ms: new Date(payrollRunAnchorDate(r) + "T12:00:00").getTime() }))
+    .map(r => ({ run: r, ms: new Date(payrollRunAnchorDate(r) + "T12:00:00").getTime(), paystub: runHasPaystub(r) }))
     .filter(a => !isNaN(a.ms));
+  const byId = new Map(anchors.map(a => [a.run.id, a]));
   const grouped = new Map();
-  for (const a of anchors) grouped.set(a.run.id, { payroll: [], taxes: [], fee: [] });
-  for (const t of (transactions || [])) {
-    if (!isPayrollBankDebit(t)) continue;
-    const tMs = new Date(String(t.date).slice(0, 10) + "T12:00:00").getTime();
-    if (isNaN(tMs)) continue;
+  for (const a of anchors) grouped.set(a.run.id, { processor: [], checks: [] });
+
+  const nearest = (tMs, pred) => {
     let best = null, bestDist = Infinity;
     for (const a of anchors) {
-      const dist = Math.abs(tMs - a.ms);
-      if (dist <= PAYROLL_BANK_WINDOW_DAYS * dayMs && dist < bestDist) { best = a; bestDist = dist; }
+      const dist = (tMs - a.ms) / dayMs;
+      if (!pred(a, dist)) continue;
+      if (Math.abs(dist) < bestDist) { best = a; bestDist = Math.abs(dist); }
     }
-    if (!best) continue;
-    grouped.get(best.run.id)[classifyPayrollBankRow(t)].push(t);
+    return best;
+  };
+  for (const t of (transactions || [])) {
+    const tMs = new Date(String(t.date).slice(0, 10) + "T12:00:00").getTime();
+    if (isNaN(tMs)) continue;
+    const pinned = settlementRunOf(t);
+    if (pinned && !byId.has(pinned)) continue;            // settled to a run we are not looking at
+    if (isPayrollBankDebit(t)) {
+      const a = pinned ? byId.get(pinned) : nearest(tMs, (_, d) => Math.abs(d) <= PAYROLL_BANK_WINDOW_DAYS);
+      if (a) grouped.get(a.run.id).processor.push(t);
+      continue;
+    }
+    if (isPayrollCheckCandidate(t, ctx)) {
+      const a = pinned ? byId.get(pinned) : nearest(tMs, (x, d) => x.paystub && d >= -PAYROLL_CHECK_WINDOW.before && d <= PAYROLL_CHECK_WINDOW.after);
+      if (a) grouped.get(a.run.id).checks.push(t);
+    }
   }
+
   const sum = arr => Math.abs(arr.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0));
   const out = new Map();
   for (const a of anchors) {
-    const rows = grouped.get(a.run.id);
+    const g = grouped.get(a.run.id);
     const totals = a.run.totals || {};
-    const bankPaid = round2(sum(rows.payroll) + sum(rows.taxes));
-    const bankFee = round2(sum(rows.fee));
-    const hasBank = rows.payroll.length + rows.taxes.length > 0;
+    const legs = classifyProcessorLegs(g.processor, a.paystub ? totals : null);
+    const deposit = round2(sum(legs.payroll));
+    const netPay = parseFloat(totals.net_pay) || 0;
+    const expectedChecks = a.paystub && legs.payroll.length > 0 ? round2(Math.max(0, netPay - deposit)) : null;
+    const checks = a.paystub ? pickPayrollChecks(g.checks, expectedChecks, a.run.id) : { taken: [], skipped: [], sum: 0 };
+    const rows = { payroll: legs.payroll, taxes: legs.taxes, fee: legs.fee, checks: checks.taken, skippedChecks: checks.skipped };
+    const bankPaid = round2(deposit + sum(legs.taxes) + checks.sum);
+    const bankFee = round2(sum(legs.fee));
+    const legCount = legs.payroll.length + legs.taxes.length + checks.taken.length;
+    const hasBank = legCount > 0;
     const favoEstimate = round2(totals.total_cash_out);
     const processorCalc = round2(totals.total_bank_debit);
     const processorLabel = PAYROLL_CALC_SOURCE_LABEL[totals.paystub_meta?.source] || (totals.paystub_meta?.source ? String(totals.paystub_meta.source) : "Processor");
@@ -8337,16 +8447,24 @@ function matchPayrollRunsToBank(runs, transactions) {
     const calcSource = processorCalc > 0 ? processorLabel : favoEstimate > 0 ? "Favo estimate" : null;
     const delta = hasBank && calculated != null ? round2(bankPaid - calculated) : null;
     const deltaPct = delta != null && calculated > 0 ? (delta / calculated) * 100 : null;
+    const outstanding = delta != null ? round2(-delta) : null;   // what the bank still owes the paystub
     const anchorPast = a.ms < Date.now() - PAYROLL_BANK_WINDOW_DAYS * dayMs;
+    const settledCount = [...legs.payroll, ...legs.taxes, ...checks.taken].filter(t => settlementRunOf(t) === a.run.id).length;
+    const shadowExists = (transactions || []).some(t => t.id === `paystub_labor_${a.run.id}`);
     let status;
     if (!hasBank) status = anchorPast ? "missing" : "pending";
     else if (calculated == null) status = "no_calc";
     else if (Math.abs(delta) <= 1) status = "match";
+    else if (a.paystub && outstanding > 1 && (expectedChecks == null || checks.skipped.length === 0 || outstanding <= expectedChecks)) status = "partial";
     else if (Math.abs(deltaPct) <= 2) status = "close";
     else status = "drift";
     out.set(a.run.id, {
       anchor: payrollRunAnchorDate(a.run),
-      rows, bankPaid, bankFee, hasBank,
+      shadowDate: payrollRunShadowDate(a.run),
+      paystub: a.paystub,
+      rows, bankPaid, bankFee, hasBank, legCount,
+      deposit, expectedChecks, checksPaid: checks.sum, outstanding,
+      settledCount, unsettledCount: legCount - settledCount, shadowExists,
       favoEstimate, processorCalc, processorLabel,
       calculated, calcSource, delta, deltaPct, status,
     });
@@ -8355,17 +8473,18 @@ function matchPayrollRunsToBank(runs, transactions) {
 }
 
 const PAYROLL_MATCH_STATUS = {
-  match:   { label: "matches bank",   color: "var(--accent)" },
-  close:   { label: "within 2%",      color: "var(--yellow)" },
-  drift:   { label: "drift",          color: "var(--red)" },
-  pending: { label: "awaiting bank",  color: "var(--text3)" },
-  missing: { label: "no bank debit",  color: "var(--yellow)" },
-  no_calc: { label: "no calculated",  color: "var(--text3)" },
+  match:   { label: "matches bank",     color: "var(--accent)" },
+  partial: { label: "awaiting checks",  color: "var(--yellow)" },
+  close:   { label: "within 2%",        color: "var(--yellow)" },
+  drift:   { label: "drift",            color: "var(--red)" },
+  pending: { label: "awaiting bank",    color: "var(--text3)" },
+  missing: { label: "no bank debit",    color: "var(--yellow)" },
+  no_calc: { label: "no calculated",    color: "var(--text3)" },
 };
 
 function PayrollMatchTag({ status, delta }) {
   const m = PAYROLL_MATCH_STATUS[status] || PAYROLL_MATCH_STATUS.no_calc;
-  const text = status === "drift" || status === "close"
+  const text = status === "drift" || status === "close" || status === "partial"
     ? `${delta >= 0 ? "+" : "−"}${fmt(Math.abs(delta))} · ${m.label}`
     : m.label;
   return (
@@ -8426,150 +8545,100 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     }
   };
 
-  // Find every Paychex/ADP/Gusto ACH within ±7 days of the paystub check date.
-  // Paychex splits a single pay period into 2-3 bank rows:
-  //   - PAYROLL ACH  (direct deposits to employees)
-  //   - TAXES ACH    (employee withholdings + employer match remittance)
-  //   - EIB INVOICE  (Paychex service fee)
-  // We classify each one by description keyword so the auto-reconciler can
-  // route them differently.
-  const findPaychexRowsInWindow = (t) => {
-    if (!t?.check_date) return { payroll: [], taxes: [], eib: [], all: [] };
-    const checkMs = new Date(t.check_date).getTime();
-    const dayMs = 86400000;
-    const all = transactions.filter(x => {
-      if (!isPayrollBankDebit(x)) return false;
-      const xMs = new Date(x.date).getTime();
-      if (Math.abs(xMs - checkMs) > PAYROLL_BANK_WINDOW_DAYS * dayMs) return false;
-      if (x.source === "payroll_settlement") return false; // already reconciled
-      return true;
-    });
-    const payroll = [], taxes = [], eib = [];
-    for (const row of all) {
-      const kind = classifyPayrollBankRow(row);
-      if (kind === "fee") eib.push(row);
-      else if (kind === "taxes") taxes.push(row);
-      else payroll.push(row);
-    }
-    return { payroll, taxes, eib, all };
-  };
-
-  // Reconcile a paystub against the bank: the Paychex PAYROLL + TAXES rows
-  // get re-tagged as `payroll_settlement` (filtered out of P&L by
-  // makeLedgerFilter), the Paychex EIB INVOICE rows get reclassified into
-  // Office & Supplies, and we materialize 3 shadow rows on the check date
-  // carrying the paystub's true labor / tips / reimb amounts. The shadows
-  // are what the P&L sums for the period.
-  //
-  // Net effect: bank-side rows stay as audit trail, P&L reflects paystub
-  // truth ($14k labor instead of bank-inflated $24k that included tip
-  // pass-through and reimbursements).
-  const autoReconcilePaystub = async (t, run) => {
-    const grouped = findPaychexRowsInWindow(t);
-    if (grouped.all.length === 0) return { matched: 0 };
-
-    const settlementIds = [...grouped.payroll, ...grouped.taxes].map(r => r.id);
-    const eibIds = grouped.eib.map(r => r.id);
-
-    const laborCat = categories.find(c => c.type === "expense" && /payroll|labor|wage/i.test(c.name || ""));
-    const tipCat   = categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
-    const reimbCat = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || ""))
+  // Categories the settlement needs. Missing ones are reported, not guessed.
+  const payrollCat = categories.find(c => c.taxLine === "Wages" || c.tax_line === "Wages") || categories.find(c => c.type === "expense" && /payroll|labor|wage/i.test(c.name || ""));
+  const tipCat     = categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
+  const reimbCat   = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || ""))
                   || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""));
-    const officeCat = categories.find(c => c.type === "expense" && /office|supplies|service.*fee|software/i.test(c.name || ""));
+  const feeCat     = categories.find(c => c.type === "expense" && /payroll.*fee|service.*fee/i.test(c.name || ""))
+                  || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""))
+                  || categories.find(c => c.type === "expense" && /bank charge|bank.*fee/i.test(c.name || ""));
+  const settleCtx = useMemo(() => ({
+    payrollCatId: payrollCat?.id || null,
+    transferCatIds: new Set(categories.filter(c => c.type === "transfer").map(c => c.id)),
+  }), [categories, payrollCat?.id]);
 
-    // 1) Settle PAYROLL + TAXES rows
-    if (settlementIds.length > 0 && tenantId && tenantId !== "demo") {
-      const { error } = await supabase
-        .from("r7_ledger_transactions")
-        .update({ source: "payroll_settlement" })
-        .in("id", settlementIds);
-      if (error) return { matched: grouped.all.length, error: "settle: " + error.message };
+  // Book a paystub run into the ledger and settle its bank legs.
+  //
+  // The P&L takes labor from the paystub, not from the bank: three shadow
+  // rows dated at the END OF THE PERIOD WORKED carry true labor cost (wages +
+  // employer match), tips charged (pass-through, a transfer category) and
+  // non-taxable reimbursements. The bank legs that paid for it -- the Paychex
+  // tax ACH, the direct-deposit ACH and the paper checks that fit the
+  // paystub's check total -- are re-tagged source='payroll_settlement' and
+  // drop out of the P&L (NON_REVENUE_SOURCES) while staying in Cash Flow and
+  // in the Transactions list as the audit trail. The Paychex service fee is
+  // the one leg that is a real expense the paystub does not carry; it keeps
+  // counting, under the fee category instead of Wages.
+  //
+  // Idempotent: shadows have fixed ids, settled legs are tagged with the run
+  // id and are re-selected first on the next pass. Re-running after a late
+  // check clears settles that check and nothing else.
+  const settlePaystubRun = async (run) => {
+    const t = run?.totals || {};
+    if (!runHasPaystub(run)) return { ok: false, reason: "no_paystub" };
+    const plan = matchPayrollRunsToBank(runs, transactions, settleCtx).get(run.id);
+    if (!plan) return { ok: false, reason: "no_plan" };
+
+    const legs = [...plan.rows.payroll, ...plan.rows.taxes, ...plan.rows.checks];
+    const tagFor = PAYROLL_SETTLEMENT_TAG + run.id;
+    const updates = [];
+    for (const row of legs) {
+      if (settlementRunOf(row) === run.id && row.source === "payroll_settlement") continue;
+      const tags = (Array.isArray(row.tags) ? row.tags : []).filter(x => !(typeof x === "string" && x.startsWith(PAYROLL_SETTLEMENT_TAG)));
+      updates.push({ ...row, source: "payroll_settlement", category: payrollCat?.id || row.category, category_id: payrollCat?.id || row.category_id || null, tags: [...tags, tagFor] });
+    }
+    for (const row of plan.rows.fee) {
+      const cat = row.category && row.category !== UNCATEGORIZED ? row.category : null;
+      const reclass = feeCat && (!cat || cat === payrollCat?.id || settleCtx.transferCatIds.has(cat)) && row.category !== feeCat.id;
+      if (row.source === "internal_transfer" || reclass) {
+        updates.push({ ...row, source: row.source === "internal_transfer" ? "plaid" : row.source, category: reclass ? feeCat.id : row.category, category_id: reclass ? feeCat.id : (row.category_id || null) });
+      }
     }
 
-    // 2) Reclassify EIB rows to Office & Supplies
-    if (eibIds.length > 0 && officeCat && tenantId && tenantId !== "demo") {
-      const { error } = await supabase
-        .from("r7_ledger_transactions")
-        .update({ category_id: officeCat.id })
-        .in("id", eibIds);
-      if (error) console.warn("reclassify EIB:", error.message);
-    }
-
-    // 3) Create shadow rows on the check_date with paystub truth
-    const shadowDate = t.check_date || run.pay_date || run.period_end;
+    const shadowDate = payrollRunShadowDate(run);
     const periodLabel = `${run.period_start} → ${run.period_end}`;
     const shadows = [
-      {
-        id: `paystub_labor_${run.id}`,
-        date: shadowDate,
+      { id: `paystub_labor_${run.id}`, amount: -Math.abs(parseFloat(t.true_labor_cost) || 0), category_id: payrollCat?.id || null,
         description: `Payroll labor (wages + employer match) — paystub ${periodLabel}`,
-        amount: -Math.abs(parseFloat(t.true_labor_cost) || 0),
-        category_id: laborCat?.id || null,
-        source: "paystub_shadow",
-        account: "Paystub",
-        reconciled: true,
-        tags: ["paystub", run.id],
-        notes: `From paystub run ${run.id}. Hourly ${t.hourly_earnings || 0} + OT ${t.overtime_earnings || 0} + employer match ${t.employer_match_total || 0}.`,
-      },
-      {
-        id: `paystub_tips_${run.id}`,
-        date: shadowDate,
+        notes: `From paystub run ${run.id}. Hourly ${t.hourly_earnings || 0} + OT ${t.overtime_earnings || 0} + employer match ${t.employer_match_total || 0}. Paid ${t.check_date || run.pay_date || "?"}.` },
+      { id: `paystub_tips_${run.id}`, amount: -Math.abs(parseFloat(t.tips_charged) || 0), category_id: tipCat?.id || null,
         description: `Tips pass-through — paystub ${periodLabel}`,
-        amount: -Math.abs(parseFloat(t.tips_charged) || 0),
-        category_id: tipCat?.id || null,
-        source: "paystub_shadow",
-        account: "Paystub",
-        reconciled: true,
-        tags: ["paystub", run.id],
-        notes: `From paystub run ${run.id}. Passthrough to staff, excluded from P&L via Tip Pass-Through (transfer category).`,
-      },
-      {
-        id: `paystub_reimb_${run.id}`,
-        date: shadowDate,
+        notes: `From paystub run ${run.id}. Passthrough to staff, excluded from P&L via the transfer category.` },
+      { id: `paystub_reimb_${run.id}`, amount: -Math.abs(parseFloat(t.reimb_non_tax) || 0), category_id: reimbCat?.id || null,
         description: `Expense reimbursement — paystub ${periodLabel}`,
-        amount: -Math.abs(parseFloat(t.reimb_non_tax) || 0),
-        category_id: reimbCat?.id || null,
-        source: "paystub_shadow",
-        account: "Paystub",
-        reconciled: true,
-        tags: ["paystub", run.id],
-        notes: `From paystub run ${run.id}. Non-taxable expense reimbursements paid through payroll.`,
-      },
-    ].filter(s => s.amount !== 0);
+        notes: `From paystub run ${run.id}. Non-taxable expense reimbursements paid through payroll.` },
+    ].filter(sh => sh.amount !== 0).map(sh => ({
+      ...sh, date: shadowDate, category: sh.category_id || UNCATEGORIZED, source: "paystub_shadow", account: "Paystub",
+      reconciled: true, tags: ["paystub", run.id],
+    }));
 
-    const upRes = await upsertTransactions(shadows, tenantId);
-    if (!upRes.ok) return { matched: grouped.all.length, error: "shadow upsert: " + (upRes.error || "unknown") };
-
-    // Optimistic local update — push the shadow rows and patch the bank rows
-    // to their new source/category so the screen updates without waiting for
-    // the realtime echo.
-    if (setTransactions) {
-      const settledSet = new Set(settlementIds);
-      const eibSet = new Set(eibIds);
-      setTransactions(prev => {
-        const patched = prev.map(x => {
-          if (settledSet.has(x.id)) return { ...x, source: "payroll_settlement" };
-          if (eibSet.has(x.id) && officeCat) return { ...x, category: officeCat.id, category_id: officeCat.id };
-          return x;
-        });
-        // De-dupe shadow ids (idempotent re-runs)
-        const shadowIds = new Set(shadows.map(s => s.id));
-        const withoutOld = patched.filter(x => !shadowIds.has(x.id));
-        return [...withoutOld, ...shadows.map(s => ({ ...s, category: s.category_id, tenant_id: tenantId }))];
+    const toSave = [...updates, ...shadows];
+    if (toSave.length > 0) {
+      if (saveTransactions) await saveTransactions(toSave);
+      const byId = new Map(toSave.map(x => [x.id, x]));
+      setTransactions?.(prev => {
+        const next = prev.map(x => byId.has(x.id) ? { ...x, ...byId.get(x.id) } : x);
+        const ids = new Set(next.map(x => x.id));
+        return [...toSave.filter(x => !ids.has(x.id)).map(x => ({ ...x, tenant_id: tenantId })), ...next];
       });
     }
-
     return {
-      matched: grouped.all.length,
-      settled: settlementIds.length,
-      eib_reclassified: eibIds.length,
-      shadows_created: shadows.length,
-      missingCats: { labor: !laborCat, tip: !tipCat, reimb: !reimbCat, office: !officeCat },
+      ok: true,
+      legs: legs.length, checks: plan.rows.checks.length, newlySettled: updates.length,
+      outstanding: plan.outstanding, shadows: shadows.length, shadowDate,
+      missingCats: { labor: !payrollCat, tip: !tipCat, reimb: !reimbCat, fee: !feeCat },
     };
   };
 
-  // Backward-compatible alias for the older call sites still using the v1 name.
-  const autoSplitPaychex = autoReconcilePaystub;
+  const describeSettlement = (res) => {
+    const warn = [];
+    if (res.missingCats?.labor) warn.push("Payroll category missing");
+    if (res.missingCats?.tip)   warn.push("Tip Pass-Through category missing");
+    if (res.missingCats?.reimb) warn.push("Reimb category missing");
+    const out = res.outstanding > 1 ? ` · ${fmt(res.outstanding)} in checks not cleared yet` : "";
+    return `Labor booked on ${res.shadowDate} · ${res.legs} bank leg${res.legs === 1 ? "" : "s"} settled (${res.checks} check${res.checks === 1 ? "" : "s"})${out}` + (warn.length ? " · ⚠️ " + warn.join(", ") : "");
+  };
 
   const savePaystubAsRun = async () => {
     if (!paystubPreview) return;
@@ -8614,13 +8683,15 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
       ? `Run ${t.period_start} → ${t.period_end} updated with paystub data`
       : `Run created · gross ${fmt(t.wages_subtotal + t.tips_charged)} · net ${fmt(t.net_pay)}`;
 
-    // Reset A — paystub saves to r7_payroll_runs but does NOT touch the
-    // ledger. The operator can still trigger the reconciliation on demand
-    // from the run detail (🔀 button), but the default is leave-alone so the
-    // P&L stays a clean cash-basis view of the bank ledger. Source comparison
-    // happens at Schedule C time using the paystub PDFs directly.
+    // The paystub is the source of truth for labor (Anderson, 02/10/2026,
+    // reversing the earlier "Reset A"): book it and settle the bank legs now.
+    // If the bank has not been debited yet the shadows still go in -- the
+    // period's labor is known the day the paystub exists -- and the legs are
+    // picked up by the pass that runs when the screen opens.
     showToast(baseMsg, "success");
     setPaystubPreview(null);
+    const res = await settlePaystubRun(saved.data || runRow);
+    if (res.ok) showToast(describeSettlement(res), res.outstanding > 1 ? "info" : "success");
   };
 
   const selected = runs.find(r => r.id === selectedId);
@@ -8628,9 +8699,9 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
   // Bank vs calculated, per run. Recomputed whenever the ledger or the runs
   // change, so a statement import flips "awaiting bank" to a real delta
   // without a refresh.
-  const bankMatch = useMemo(() => matchPayrollRunsToBank(runs, transactions), [runs, transactions]);
+  const bankMatch = useMemo(() => matchPayrollRunsToBank(runs, transactions, settleCtx), [runs, transactions, settleCtx]);
   const matchCounts = useMemo(() => {
-    const c = { match: 0, close: 0, drift: 0, pending: 0, missing: 0, no_calc: 0 };
+    const c = { match: 0, partial: 0, close: 0, drift: 0, pending: 0, missing: 0, no_calc: 0 };
     for (const m of bankMatch.values()) c[m.status] = (c[m.status] || 0) + 1;
     return c;
   }, [bankMatch]);
@@ -8723,44 +8794,42 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   const statusColor = { draft: "var(--text2)", approved: "var(--blue)", submitted: "var(--yellow)", reconciled: "var(--accent)", cancelled: "var(--text3)" };
 
-  // Background auto-reconciler. Whenever transactions or runs change (statement
-  // import, realtime push, etc), scan every paystub-fed run and see if its
-  // Paychex ACH has appeared in the ledger. Exactly one unambiguous candidate
-  // = silent split + toast notification. Guards against re-running on the same
-  // parent twice with a session-level Set; that survives prop churn but resets
-  // on a hard refresh, which is fine because a refresh re-loads the ledger and
-  // the parent will already have its children (skipped by findPaychexCandidates).
-  const autoReconciledRef = useRef(new Set());
-  // Background auto-reconciler removed by Anderson's "Reset A" decision.
-  // The paystub still imports into r7_payroll_runs, but the ledger stays
-  // bank-driven — no shadows are created, no Paychex rows get re-tagged.
-  // The 🔀 button on the run detail page is the only path that touches the
-  // ledger, and only when explicitly clicked.
+  // Settlement pass on the screen. For every paystub run whose check date has
+  // passed: if the labor shadow is missing, or a bank leg sits in the plan
+  // without the run's tag (a check that cleared since last time), settle it.
+  // Converges on its own -- once everything is tagged and the shadow exists
+  // there is nothing left to do -- and runs at most once per run per mount so
+  // a failing save cannot loop.
+  const settledOnceRef = useRef(new Set());
+  useEffect(() => {
+    if (!tenantId || tenantId === "demo") return;
+    const today = new Date().toISOString().slice(0, 10);
+    const plans = matchPayrollRunsToBank(runs, transactions, settleCtx);
+    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r) && (payrollRunAnchorDate(r) || "9999") <= today);
+    for (const r of due) {
+      const plan = plans.get(r.id);
+      if (!plan) continue;
+      const needs = !plan.shadowExists || plan.unsettledCount > 0;
+      if (!needs || settledOnceRef.current.has(r.id)) continue;
+      settledOnceRef.current.add(r.id);
+      settlePaystubRun(r).then(res => {
+        if (res.ok && res.newlySettled + (plan.shadowExists ? 0 : res.shadows) > 0) showToast(`${r.period_start} → ${r.period_end}: ` + describeSettlement(res), "info");
+      }).catch(e => console.error("payroll settle", r.id, e));
+    }
+  }, [runs, transactions, settleCtx, tenantId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Retry the auto-split for the currently-selected run. Useful when the
-  // paystub was saved first and the bank ACH only arrived later — clicking
-  // this button re-runs the same matcher and split as savePaystubAsRun.
+  // Manual re-run for the selected run: a late check cleared, a category was
+  // created, the first pass hit an error.
   const retryAutoSplit = async () => {
     if (!selected) return;
-    const t = selected.totals || {};
-    if (!t.true_labor_cost && !t.wages_subtotal) {
+    if (!runHasPaystub(selected)) {
       showToast("This run has no paystub data — import a paystub PDF first", "error");
       return;
     }
-    autoReconciledRef.current.delete(selected.id); // allow retry
-    const res = await autoReconcilePaystub(t, selected);
-    if (res.matched === 0) {
-      showToast("No Paychex ACH found within ±7 days of the check date", "info");
-    } else if (res.error) {
-      showToast("Reconcile failed: " + res.error, "error");
-    } else {
-      const tags = [];
-      if (res.missingCats?.labor)  tags.push("Labor cat missing");
-      if (res.missingCats?.tip)    tags.push("Tip Pass-Through cat missing");
-      if (res.missingCats?.reimb)  tags.push("Reimb cat missing");
-      const warn = tags.length ? " · ⚠️ " + tags.join(", ") : "";
-      showToast(`Paystub reconciled · ${res.settled} ACH${res.settled === 1 ? "" : "s"} settled · ${res.shadows_created} shadow rows` + warn, "success");
-    }
+    settledOnceRef.current.delete(selected.id);
+    const res = await settlePaystubRun(selected);
+    if (!res.ok) { showToast("Nothing to settle yet", "info"); return; }
+    showToast(describeSettlement(res), res.outstanding > 1 ? "info" : "success");
   };
 
   return (
@@ -8800,11 +8869,11 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
         <div className="card" style={{ marginBottom: 16, padding: "12px 16px", display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap" }}>
           <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Bank vs calculated</div>
           <div style={{ fontSize: 11, color: "var(--text3)", flex: 1, minWidth: 220 }}>
-            Each run's calculated cost (Favo estimate, or the processor's number from a paystub / Paychex) against the Paychex · ADP · Gusto debits that actually hit the bank within ±{PAYROLL_BANK_WINDOW_DAYS} days of the pay date.
+            Each run's calculated cost (Favo estimate, or the processor's number from a paystub / Paychex) against what actually left the bank: the processor's ACH legs within ±{PAYROLL_BANK_WINDOW_DAYS} days of the pay date plus the paper checks that fit the paystub's check total. A paystub run books its labor in the P&L on the period's end date; the bank legs are settled out so nothing counts twice.
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {[
-              ["match", matchCounts.match], ["close", matchCounts.close], ["drift", matchCounts.drift],
+              ["match", matchCounts.match], ["partial", matchCounts.partial], ["close", matchCounts.close], ["drift", matchCounts.drift],
               ["missing", matchCounts.missing], ["pending", matchCounts.pending],
             ].filter(([, n]) => n > 0).map(([st, n]) => {
               const m = PAYROLL_MATCH_STATUS[st];
@@ -8855,11 +8924,11 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
                       </td>
                       <td className="text-right mono">
                         {m?.hasBank ? fmt(m.bankPaid) : <span style={{ color: "var(--text3)" }}>—</span>}
-                        {m?.hasBank && m.bankFee > 0 && <div style={{ fontSize: 9, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>+ fee {fmt(m.bankFee)}</div>}
+                        {m?.hasBank && <div style={{ fontSize: 9, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>{m.legCount} leg{m.legCount === 1 ? "" : "s"}{m.rows.checks.length ? ` · ${m.rows.checks.length} check${m.rows.checks.length === 1 ? "" : "s"}` : ""}{m.bankFee > 0 ? ` · fee ${fmt(m.bankFee)}` : ""}</div>}
                       </td>
                       <td className="text-right mono" style={{ color: deltaColor }}>
                         {m?.delta != null
-                          ? <>{m.delta >= 0 ? "+" : "−"}{fmt(Math.abs(m.delta))}<div style={{ fontSize: 9, fontFamily: "var(--font-mono)" }}>{m.deltaPct >= 0 ? "+" : ""}{m.deltaPct.toFixed(1)}%</div></>
+                          ? <>{m.delta >= 0 ? "+" : "−"}{fmt(Math.abs(m.delta))}<div style={{ fontSize: 9, fontFamily: "var(--font-mono)" }}>{m.status === "partial" ? "checks pending" : `${m.deltaPct >= 0 ? "+" : ""}${m.deltaPct.toFixed(1)}%`}</div></>
                           : <span style={{ fontSize: 10, color: "var(--text3)" }}>{m ? PAYROLL_MATCH_STATUS[m.status].label : "—"}</span>}
                       </td>
                     </tr>
@@ -8881,13 +8950,13 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
                 <span className="tag" style={{ marginLeft: 12, background: statusColor[selected.status] + "20", color: statusColor[selected.status], border: `1px solid ${statusColor[selected.status]}40`, fontSize: 10 }}>{selected.status}</span>
               </div>
               <div style={{ display: "flex", gap: 8 }}>
-                {selected.totals?.total_bank_debit > 0 && (
+                {runHasPaystub(selected) && (
                   <button
                     className="btn btn-outline btn-sm"
                     onClick={retryAutoSplit}
-                    title="Find the matching Paychex ACH in the bank ledger and split it into Labor / Tips / Reimbursement using this run's paystub data"
+                    title="Book this paystub's labor / tips / reimbursements in the P&L and settle the bank legs (Paychex ACHs and payroll checks). Safe to re-run after a late check clears."
                   >
-                    🔀 Auto-split Paychex ACH
+                    🔀 Settle with bank
                   </button>
                 )}
                 <button className="btn btn-outline btn-sm" onClick={() => exportPayrollCSV(selected)}><Icon name="download" size={13} /> Export Paychex CSV</button>
@@ -9003,11 +9072,16 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 function PayrollBankCompare({ run, match }) {
   if (!run) return null;
   const t = run.totals || {};
-  const m = match || { rows: { payroll: [], taxes: [], fee: [] }, hasBank: false, status: "pending", favoEstimate: round2(t.total_cash_out), processorCalc: round2(t.total_bank_debit), processorLabel: "Processor", calculated: null, calcSource: null, delta: null, deltaPct: null, bankPaid: 0, bankFee: 0, anchor: payrollRunAnchorDate(run) };
+  const m = match || { rows: { payroll: [], taxes: [], fee: [], checks: [], skippedChecks: [] }, hasBank: false, status: "pending", favoEstimate: round2(t.total_cash_out), processorCalc: round2(t.total_bank_debit), processorLabel: "Processor", calculated: null, calcSource: null, delta: null, deltaPct: null, bankPaid: 0, bankFee: 0, legCount: 0, outstanding: null, expectedChecks: null, checksPaid: 0, settledCount: 0, shadowExists: false, paystub: runHasPaystub(run), anchor: payrollRunAnchorDate(run), shadowDate: payrollRunShadowDate(run) };
   const st = PAYROLL_MATCH_STATUS[m.status] || PAYROLL_MATCH_STATUS.no_calc;
   const hasFavo = m.favoEstimate > 0;
   const hasProc = m.processorCalc > 0;
-  const bankRows = [...m.rows.payroll, ...m.rows.taxes, ...m.rows.fee].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const bankRows = [
+    ...m.rows.taxes.map(r => ({ r, kind: "taxes" })),
+    ...m.rows.payroll.map(r => ({ r, kind: "deposit" })),
+    ...m.rows.checks.map(r => ({ r, kind: "check" })),
+    ...m.rows.fee.map(r => ({ r, kind: "fee" })),
+  ].sort((a, b) => String(a.r.date).localeCompare(String(b.r.date)));
 
   // Calibration: Favo assumes PAYROLL_EMPLOYER_BURDEN on gross. When the
   // processor's number is here we can see the real employer match and say
@@ -9030,8 +9104,14 @@ function PayrollBankCompare({ run, match }) {
       <span className="mono" style={{ fontSize: 12, color: opts.color || "var(--text)", fontWeight: opts.bold ? 700 : 400 }}>{typeof value === "number" ? fmt(value) : value}</span>
     </div>
   );
-  const kindLabel = { payroll: "PAYROLL", taxes: "TAXES", fee: "FEE" };
-  const kindColor = { payroll: "var(--accent)", taxes: "var(--blue)", fee: "var(--text3)" };
+  const kindLabel = { taxes: "TAXES", deposit: "DEPOSIT", check: "CHECK", fee: "FEE" };
+  const kindColor = { taxes: "var(--blue)", deposit: "var(--accent)", check: "var(--purple)", fee: "var(--text3)" };
+  const bankSub = m.hasBank
+    ? `${m.legCount} leg${m.legCount === 1 ? "" : "s"}${m.rows.checks.length ? ` · ${m.rows.checks.length} check${m.rows.checks.length === 1 ? "" : "s"}` : ""}${m.bankFee > 0 ? ` · fee ${fmt(m.bankFee)}` : ""}`
+    : st.label;
+  const deltaSub = m.delta == null
+    ? (m.calcSource ? `vs ${m.calcSource}` : "nothing to compare")
+    : m.status === "partial" ? `checks not cleared yet · vs ${m.calcSource}` : `${m.deltaPct >= 0 ? "+" : ""}${m.deltaPct.toFixed(1)}% vs ${m.calcSource}`;
 
   return (
     <div className="card" style={{ marginBottom: 16, borderLeft: `3px solid ${st.color}` }}>
@@ -9039,7 +9119,7 @@ function PayrollBankCompare({ run, match }) {
         <div>
           <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Bank vs calculated</div>
           <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
-            Debits matching Paychex · ADP · Gusto within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor || "the pay date"}. The processor's fee is shown apart — it is not payroll.
+            Processor ACH legs within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor || "the pay date"}{m.paystub ? `, plus payroll checks cleared up to ${PAYROLL_CHECK_WINDOW.after} days after it` : ""}. The processor's fee is shown apart — it is a real expense, not payroll.
           </div>
         </div>
         <PayrollMatchTag status={m.status} delta={m.delta} />
@@ -9047,10 +9127,21 @@ function PayrollBankCompare({ run, match }) {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
         {kpi("Favo estimate", hasFavo ? fmt(m.favoEstimate) : "—", hasFavo ? `Square hours · +${(PAYROLL_EMPLOYER_BURDEN * 100).toFixed(0)}% burden` : "no Square lines")}
-        {kpi(m.processorLabel, hasProc ? fmt(m.processorCalc) : "—", hasProc ? "what the processor will pull" : "import a paystub PDF", hasProc ? "var(--yellow)" : undefined)}
-        {kpi("Bank paid", m.hasBank ? fmt(m.bankPaid) : "—", m.hasBank ? `${m.rows.payroll.length + m.rows.taxes.length} debit${m.rows.payroll.length + m.rows.taxes.length === 1 ? "" : "s"}${m.bankFee > 0 ? ` · fee ${fmt(m.bankFee)}` : ""}` : st.label)}
-        {kpi("Δ bank − calc", m.delta != null ? `${m.delta >= 0 ? "+" : "−"}${fmt(Math.abs(m.delta))}` : "—", m.delta != null ? `${m.deltaPct >= 0 ? "+" : ""}${m.deltaPct.toFixed(1)}% vs ${m.calcSource}` : (m.calcSource ? `vs ${m.calcSource}` : "nothing to compare"), m.delta != null ? st.color : undefined)}
+        {kpi(m.processorLabel, hasProc ? fmt(m.processorCalc) : "—", hasProc ? "what the processor pulls, incl. checks" : "import a paystub PDF", hasProc ? "var(--yellow)" : undefined)}
+        {kpi("Bank paid", m.hasBank ? fmt(m.bankPaid) : "—", bankSub)}
+        {kpi(m.status === "partial" ? "Still to clear" : "Δ bank − calc",
+             m.status === "partial" ? fmt(m.outstanding) : (m.delta != null ? `${m.delta >= 0 ? "+" : "−"}${fmt(Math.abs(m.delta))}` : "—"),
+             deltaSub, m.delta != null ? st.color : undefined)}
       </div>
+
+      {m.paystub && (
+        <div style={{ marginBottom: 14, padding: "8px 10px", background: "var(--surface2)", borderRadius: "var(--radius2)", fontSize: 11, color: "var(--text2)", lineHeight: 1.6 }}>
+          <strong>P&L.</strong> This run books <span className="mono">{fmt(parseFloat(t.true_labor_cost) || 0)}</span> of labor on <span className="mono">{m.shadowDate}</span> (end of the period worked), tips <span className="mono">{fmt(parseFloat(t.tips_charged) || 0)}</span> as pass-through and reimbursements <span className="mono">{fmt(parseFloat(t.reimb_non_tax) || 0)}</span> as their own expense.
+          {m.shadowExists
+            ? <> Booked. {m.settledCount} bank leg{m.settledCount === 1 ? "" : "s"} settled{m.unsettledCount > 0 ? `, ${m.unsettledCount} waiting for the next pass` : ""}.</>
+            : <> Not booked yet — it happens when this screen runs its pass, or now with <strong>Settle with bank</strong>.</>}
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
         <div>
@@ -9062,6 +9153,10 @@ function PayrollBankCompare({ run, match }) {
               {line("Reimbursements (non-tax)", parseFloat(t.reimb_non_tax) || 0, { color: "var(--blue)" })}
               {line("Employer match (SS · Medicare · FUTA · SUTA)", parseFloat(t.employer_match_total) || 0)}
               {line(`${m.processorLabel} total bank debit`, m.processorCalc, { bold: true, color: "var(--yellow)" })}
+              <div style={{ height: 6 }} />
+              {line("of which net pay to employees", parseFloat(t.net_pay) || 0, { dim: true })}
+              {line("of which taxes remitted", parseFloat(t.total_tax_liability) || 0, { dim: true })}
+              {m.expectedChecks != null && line("net pay by paper check (net pay − direct deposit)", m.expectedChecks, { dim: true })}
             </>
           ) : hasFavo ? (
             <>
@@ -9078,9 +9173,6 @@ function PayrollBankCompare({ run, match }) {
               {actualBurdenPct != null && (
                 <> Actual employer burden <span className="mono" style={{ color: Math.abs(actualBurdenPct - PAYROLL_EMPLOYER_BURDEN * 100) > 3 ? "var(--yellow)" : "var(--accent)" }}>{actualBurdenPct.toFixed(1)}%</span> of gross vs {(PAYROLL_EMPLOYER_BURDEN * 100).toFixed(0)}% assumed.</>
               )}
-              {Math.abs(favoVsProc) > 0 && (parseFloat(t.tips_charged) || 0) + (parseFloat(t.reimb_non_tax) || 0) > 0 && (
-                <> Tips and reimbursements ride the same ACH but are not labor cost.</>
-              )}
             </div>
           )}
         </div>
@@ -9094,19 +9186,26 @@ function PayrollBankCompare({ run, match }) {
             </div>
           ) : (
             <>
-              {bankRows.map(r => {
-                const kind = classifyPayrollBankRow(r);
+              {bankRows.map(({ r, kind }) => {
+                const settled = settlementRunOf(r) === run.id;
                 return (
                   <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: "1px dotted var(--border)" }}>
                     <span className="mono" style={{ fontSize: 11, color: "var(--text3)", flexShrink: 0 }}>{fmtShort(r.date)}</span>
                     <span style={{ fontSize: 11, color: "var(--text2)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.description}>{r.description}</span>
                     <span className="tag" style={{ fontSize: 9, background: kindColor[kind] + "20", color: kindColor[kind], border: `1px solid ${kindColor[kind]}40`, flexShrink: 0 }}>{kindLabel[kind]}</span>
+                    {kind !== "fee" && <span title={settled ? "Settled: excluded from the P&L, the paystub shadow counts instead" : "Candidate, not settled yet"} style={{ fontSize: 10, color: settled ? "var(--accent)" : "var(--text3)", flexShrink: 0 }}>{settled ? "✓" : "○"}</span>}
                     <span className="mono" style={{ fontSize: 12, flexShrink: 0, color: kind === "fee" ? "var(--text3)" : "var(--text)" }}>{fmt(Math.abs(parseFloat(r.amount) || 0))}</span>
                   </div>
                 );
               })}
-              {line("Bank paid (payroll + taxes)", m.bankPaid, { bold: true })}
-              {m.bankFee > 0 && line("Processor fee (not payroll)", m.bankFee, { dim: true })}
+              {line("Bank paid (taxes + deposit + checks)", m.bankPaid, { bold: true })}
+              {m.status === "partial" && line("Checks not cleared yet", m.outstanding, { color: "var(--yellow)" })}
+              {m.bankFee > 0 && line("Processor fee (expense, not payroll)", m.bankFee, { dim: true })}
+              {m.rows.skippedChecks?.length > 0 && (
+                <div style={{ marginTop: 8, fontSize: 10, color: "var(--text3)", lineHeight: 1.5 }}>
+                  Not taken — would exceed the paystub's check total: {m.rows.skippedChecks.map(c => `${c.description} ${fmt(Math.abs(parseFloat(c.amount) || 0))}`).join(" · ")}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -9339,8 +9438,10 @@ function Labor({ shifts, transactions, categories, tenantId, dateRange, onSync, 
 
   // Actual payroll from ledger — match by Wages tax line or Payroll category name
   const payrollCat = categories.find(c => c.taxLine === "Wages" || c.name === "Payroll");
+  // isRevenueRelevant drops the settled bank legs (source payroll_settlement)
+  // so a reconciled run counts once, from its paystub shadow.
   const actualPayroll = payrollCat
-    ? Math.abs(transactions.filter(t => t.category === payrollCat.id && parseFloat(t.amount) < 0)
+    ? Math.abs(transactions.filter(t => t.category === payrollCat.id && parseFloat(t.amount) < 0 && isRevenueRelevant(t))
         .reduce((s, t) => s + parseFloat(t.amount || 0), 0))
     : 0;
 

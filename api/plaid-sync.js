@@ -169,8 +169,14 @@ const TRANSFER_RES = [
   /^online banking transfer\s+(to|from)/i, // checking <-> savings
 ];
 // Plaid's own labels for own-account movement. Sharper than the descriptor
-// when the bank's wording drifts.
+// when the bank's wording drifts -- but Plaid also hangs ACCOUNT_TRANSFER on
+// paper checks and on payroll-processor batches, which are money LEAVING the
+// business. Trusting the label alone filed $74k of TorresBee payroll
+// (Paychex direct deposits + employee checks, Jul-Sep 2026) as internal
+// transfers, out of the P&L. A row whose descriptor says check / Zelle /
+// payroll processor is never an own-account transfer, whatever Plaid says.
 const TRANSFER_PFC = new Set(["TRANSFER_IN_ACCOUNT_TRANSFER", "TRANSFER_OUT_ACCOUNT_TRANSFER"]);
+const NEVER_TRANSFER_RE = /^check\s*#?\s*\d+|\bpaychex\b|\badp\b|\bgusto\b|\bpayroll\b|\bzelle\b/i;
 
 // Transfer-type accounts that hold the rows which must never reach the P&L.
 // Names, not ids: the ledger accounts are per-tenant, and nameToId already
@@ -189,7 +195,7 @@ function classifySource(t, description) {
   // = money leaving the account, so an inflow is t.amount < 0.
   if (Number(t.amount) < 0 && AGGREGATOR_RE.test(description)) return "aggregator_settlement";
   if (TRANSFER_RES.some((re) => re.test(description))) return "internal_transfer";
-  if (TRANSFER_PFC.has(t.personal_finance_category?.detailed)) return "internal_transfer";
+  if (TRANSFER_PFC.has(t.personal_finance_category?.detailed) && !NEVER_TRANSFER_RE.test(description)) return "internal_transfer";
   return "plaid";
 }
 
