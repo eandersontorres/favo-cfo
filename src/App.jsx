@@ -8491,11 +8491,17 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   // Categories the settlement needs. Missing ones are reported, not guessed.
   const payrollCat = categories.find(c => c.taxLine === "Wages" || c.tax_line === "Wages") || categories.find(c => c.type === "expense" && /payroll|labor|wage/i.test(c.name || ""));
-  const tipCat     = categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
-  const reimbCat   = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || ""))
-                  || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""));
+  // Name-first lookups. A loose /tip/ picked "Tips Payable" over "Tip
+  // Pass-Through" (the account the Square tips sync credits), and a loose
+  // /office|supplies/ picked "Cleaning Supplies" for reimbursements and the
+  // Paychex fee because it sorts before "Office & Supplies".
+  const tipCat     = categories.find(c => c.type === "transfer" && /pass.?through/i.test(c.name || ""))
+                  || categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
+  const officeCat  = categories.find(c => c.type === "expense" && /^office/i.test(c.name || ""))
+                  || categories.find(c => c.type === "expense" && /office/i.test(c.name || ""));
+  const reimbCat   = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || "")) || officeCat;
   const feeCat     = categories.find(c => c.type === "expense" && /payroll.*fee|service.*fee/i.test(c.name || ""))
-                  || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""))
+                  || officeCat
                   || categories.find(c => c.type === "expense" && /bank charge|bank.*fee/i.test(c.name || ""));
   const settleCtx = useMemo(() => ({
     payrollCatId: payrollCat?.id || null,
@@ -8738,9 +8744,11 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   const statusColor = { draft: "var(--text2)", approved: "var(--blue)", submitted: "var(--yellow)", reconciled: "var(--accent)", cancelled: "var(--text3)" };
 
-  // Settlement pass on the screen. For every paystub run whose check date has
-  // passed: if the labor shadow is missing, or a bank leg sits in the plan
-  // without the run's tag (a check that cleared since last time), settle it.
+  // Settlement pass on the screen. For every paystub run: if the labor shadow
+  // is missing, book it (the period's labor is known the day the paystub
+  // exists, whatever the check date); and once the check date has passed, if
+  // a bank leg sits in the plan without the run's tag (a check that cleared
+  // since last time), settle it.
   // Converges on its own -- once everything is tagged and the shadow exists
   // there is nothing left to do -- and runs at most once per run per mount so
   // a failing save cannot loop.
@@ -8749,11 +8757,12 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     if (!tenantId || tenantId === "demo") return;
     const today = new Date().toISOString().slice(0, 10);
     const plans = matchPayrollRunsToBank(runs, transactions, settleCtx);
-    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r) && (payrollRunAnchorDate(r) || "9999") <= today);
+    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r));
     for (const r of due) {
       const plan = plans.get(r.id);
       if (!plan) continue;
-      const needs = !plan.shadowExists || plan.unsettledCount > 0;
+      const checkDatePassed = (payrollRunAnchorDate(r) || "9999") <= today;
+      const needs = !plan.shadowExists || (checkDatePassed && plan.unsettledCount > 0);
       if (!needs || settledOnceRef.current.has(r.id)) continue;
       settledOnceRef.current.add(r.id);
       settlePaystubRun(r).then(res => {
