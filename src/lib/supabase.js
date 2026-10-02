@@ -563,16 +563,32 @@ async function loadResolutionContext(purchases, tid) {
     for (const it of items) if (it?._mappedItemId) mappedIds.add(String(it._mappedItemId))
   }
 
+  // The whole item catalogue, not just the ids the invoice lines point at.
+  // Kitchen's scanner leaves _mappedItemId empty on lines whose item it
+  // already knows (TorresBee: 101 such lines since Jul/2026, 57 of them for
+  // items that exist, with category), so we need the catalogue to find the
+  // item by the vendor's product code or by exact name. 423 rows for the
+  // pilot; one query.
   const catByItem = new Map()
-  const ids = [...mappedIds]
-  // PostgREST puts the `in` list in the URL; keep each request well under the
-  // length limit.
-  for (let i = 0; i < ids.length; i += 200) {
-    const { data: rows, error } = await supabase
-      .from('r7_items').select('id, catId').eq('tenant_id', tid).in('id', ids.slice(i, i + 200))
-    if (error) { console.error('loadResolutionContext/items', error); continue }
-    for (const r of (rows || [])) catByItem.set(String(r.id), r.catId == null ? null : String(r.catId))
+  const byCode = new Map()   // vendor product code → Set<item id>
+  const byName = new Map()   // normalised name     → Set<item id>
+  const { data: catalogue, error: cErr } = await supabase
+    .from('r7_items').select('id, name, recipeName, catId, sku, vendors').eq('tenant_id', tid)
+  if (cErr) console.error('loadResolutionContext/items', cErr)
+  const addKey = (map, key, id) => { if (!key) return; if (!map.has(key)) map.set(key, new Set()); map.get(key).add(id) }
+  for (const r of (catalogue || [])) {
+    const id = String(r.id)
+    catByItem.set(id, r.catId == null ? null : String(r.catId))
+    addKey(byName, normalizeItemKey(r.name), id)
+    addKey(byName, normalizeItemKey(r.recipeName), id)
+    addKey(byCode, String(r.sku || '').trim(), id)
+    for (const v of parseItems(r.vendors)) {
+      addKey(byCode, String(v?.code || '').trim(), id)
+      addKey(byName, normalizeItemKey(v?.invoiceName), id)
+    }
   }
+  // Any mapped id the catalogue did not return (deleted item) resolves to nothing.
+  for (const id of mappedIds) if (!catByItem.has(id)) catByItem.set(id, null)
 
   const { data: mapRows, error: mErr } = await supabase
     .from('r7_ledger_kitchen_category_map')
@@ -582,7 +598,37 @@ async function loadResolutionContext(purchases, tid) {
 
   const rules = new Map((await fetchItemRules(tid)).map(r => [ruleKey(r.vendor_key, r.item_key), r.ledger_account_id]))
 
-  return { itemsByPurchase, catByItem, acctByCat, rules }
+  return { itemsByPurchase, catByItem, byCode, byName, acctByCat, rules }
+}
+
+// One Kitchen item (never a guess) for a line the scanner did not link:
+//   1. the line's _mappedItemId, when Kitchen did link it
+//   2. the vendor's product code on the line, against the codes Kitchen keeps
+//      on the item (r7_items.vendors[].code, sku)
+//   3. the line's exact normalised name, against item name, recipe name and
+//      the invoice names Kitchen has seen for it
+// A key that points at two items with DIFFERENT categories is ambiguous and
+// is skipped -- the line stays unresolved and asks for a decision. Two items
+// in the same category are fine: the account is the same either way.
+function findKitchenItem(line, ctx) {
+  if (line?._mappedItemId) return { itemId: String(line._mappedItemId), via: 'invoice' }
+  const pick = (ids) => {
+    if (!ids || ids.size === 0) return null
+    const cats = new Set([...ids].map(id => ctx.catByItem.get(id) ?? null))
+    if (cats.size !== 1) return null
+    return [...ids][0]
+  }
+  const code = String(line?.productCode || '').trim()
+  if (code && ctx.byCode) {
+    const id = pick(ctx.byCode.get(code))
+    if (id) return { itemId: id, via: 'code' }
+  }
+  const key = normalizeItemKey(line?.name)
+  if (key && ctx.byName) {
+    const id = pick(ctx.byName.get(key))
+    if (id) return { itemId: id, via: 'name' }
+  }
+  return null
 }
 
 // One invoice line → { accountId, kitchenCatId, resolvedBy }.
@@ -595,12 +641,13 @@ export function resolveLineAccount(line, vendorName, ctx) {
     const global = ctx.rules.get(ruleKey('', itemKey))
     if (global) return { accountId: global, kitchenCatId: null, resolvedBy: 'rule' }
   }
-  const kcat = line?._mappedItemId ? (ctx.catByItem.get(String(line._mappedItemId)) ?? null) : null
+  const hit = findKitchenItem(line, ctx)
+  const kcat = hit ? (ctx.catByItem.get(hit.itemId) ?? null) : null
   if (kcat) {
     const acct = ctx.acctByCat.get(kcat) || null
-    return { accountId: acct, kitchenCatId: kcat, resolvedBy: acct ? 'kitchen' : null }
+    return { accountId: acct, kitchenCatId: kcat, resolvedBy: acct ? 'kitchen' : null, kitchenVia: hit.via, kitchenItemId: hit.itemId }
   }
-  return { accountId: null, kitchenCatId: null, resolvedBy: null }
+  return { accountId: null, kitchenCatId: null, resolvedBy: null, kitchenVia: hit ? hit.via : null, kitchenItemId: hit ? hit.itemId : null }
 }
 
 // Sum lines into { categoryId, amount } buckets, descending.
@@ -662,7 +709,8 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
   const ctx = await loadResolutionContext([pur], tid)
   const items = ctx.itemsByPurchase.get(String(pur.id)) || []
 
-  const catIds = [...new Set([...ctx.catByItem.values()].filter(Boolean))]
+  const resolved = items.map(it => resolveLineAccount(it, pur.supplier, ctx))
+  const catIds = [...new Set(resolved.map(r => r.kitchenCatId).filter(Boolean))]
   const catNames = new Map()
   if (catIds.length > 0) {
     const { data: cats, error } = await supabase
@@ -672,16 +720,19 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
   }
 
   const lines = items.map((it, idx) => {
-    const r = resolveLineAccount(it, pur.supplier, ctx)
-    const mapped = it?._mappedItemId ? String(it._mappedItemId) : null
-    const kcat = mapped ? (ctx.catByItem.get(mapped) ?? null) : null
+    const r = resolved[idx]
+    const kcat = r.kitchenCatId
     return {
       idx,
       name: String(it?.name || '').trim() || '(unnamed line)',
       qty: parseFloat(it?.qty) || 0,
       unit: it?.unit || '',
       landed: lineValue(it),
-      mappedItemId: mapped,
+      productCode: it?.productCode ? String(it.productCode) : null,
+      mappedItemId: r.kitchenItemId || null,
+      // 'invoice' = Kitchen linked the line; 'code' / 'name' = the CFO found
+      // the item in the catalogue; null = no item at all.
+      kitchenVia: r.kitchenVia || null,
       kitchenCatId: kcat,
       kitchenCatName: kcat ? (catNames.get(kcat) || kcat) : null,
       accountId: r.accountId,

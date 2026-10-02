@@ -2163,7 +2163,15 @@ function KitchenInvoicePanel({ txn, allTransactions, categories, tenantId, setTr
                     <td className="mono text-right" style={{ padding: "3px 6px", color: "var(--text3)", whiteSpace: "nowrap" }}>{line.qty}{line.unit ? ` ${line.unit}` : ""}</td>
                     <td className="mono text-right" style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>{fmt(line.landed)}</td>
                     <td style={{ padding: "3px 6px", color: line.kitchenCatName ? "var(--text2)" : "var(--text3)", whiteSpace: "nowrap" }}>
-                      {line.kitchenCatName || (line.mappedItemId ? "mapped item, no category" : "not mapped in Kitchen")}
+                      {line.kitchenCatName || (line.mappedItemId ? "mapped item, no category" : "no matching item in Kitchen")}
+                      {line.kitchenCatName && line.kitchenVia && line.kitchenVia !== "invoice" && (
+                        <span className="tag" style={{ marginLeft: 6, fontSize: 9, color: "var(--text3)", background: "var(--surface3)", border: "1px solid var(--border)" }}
+                          title={line.kitchenVia === "code"
+                            ? `Kitchen did not link this line; the CFO found the item by the vendor code ${line.productCode || ""} Kitchen keeps on it`
+                            : "Kitchen did not link this line; the CFO found the item by its exact name"}>
+                          by {line.kitchenVia}
+                        </span>
+                      )}
                     </td>
                     <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>
                       {line.accountId ? (
