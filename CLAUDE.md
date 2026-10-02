@@ -106,6 +106,8 @@ All tables live in the **shared Kitchen Supabase project** with `r7_ledger_*` pr
 | `r7_aggregator_payouts` | DoorDash / UberEats / GrubHub / Wix settlements |
 | `r7_ingest_addresses` | Per-tenant inbound email addresses (`<token>@payouts.favo.team`) |
 | `r7_ingest_events` | Log of every inbound email and what happened to it |
+| `r7_ledger_kitchen_category_map` | Kitchen category → ledger account (`supabase_kitchen_category_map.sql`) |
+| `r7_ledger_item_rules` | Invoice line item name → ledger account, set from the Transactions invoice panel (`supabase_item_rules.sql`) |
 
 ### Ecosystem bridges (read-only access)
 
@@ -441,7 +443,13 @@ Nothing un-pays a bill yet, on any of the three paths.
 
 **Sync Kitchen skips a purchase whose bill is paid** (`paidKitchenPurchaseIds`). The dedupe used to be "is this id in the ledger?", so a shadow the bill flow had just deleted came straight back on the next sync and the invoice counted twice — Jul–Sep 2026 had $17k of that. `supabase_cleanup_kitchen_shadow_dupes.sql` removes the ones created before the fix (manual, with backup).
 
-**The shadow is written already split by line item.** `purchasesToTransactions` takes the per-invoice breakdown from `fetchPurchaseAllocations` (Kitchen item → `r7_items.catId` → `r7_ledger_kitchen_category_map` → ledger account) and, when it spans more than one account, writes a parent with the invoice total plus children `kitchen_purchase_<pid>_alloc_<n>` per account. Children keep `source='kitchen_purchase'` and are told apart by `parent_id`; `makeLedgerFilter` drops the parent, so P&L / Insights / Budget count the children. A line Kitchen has not categorised becomes an `UNCATEGORIZED` child, on purpose. The bill derivation and every shadow delete handle parent + children (`withoutShadowRows`; the DB cascades on `parent_id`).
+**The shadow is written already split by line item.** `purchasesToTransactions` → `buildKitchenShadowRows` takes the per-invoice breakdown from `fetchPurchaseAllocations` and, when it spans more than one account, writes a parent with the invoice total plus children `kitchen_purchase_<pid>_alloc_<account id | uncat>` per account. Child ids are keyed by **account, not position**: the breakdown changes after the fact and a positional id would point at a different slice. Children keep `source='kitchen_purchase'` and are told apart by `parent_id`; `makeLedgerFilter` drops the parent, so P&L / Insights / Budget count the children. A line nothing resolves becomes an `UNCATEGORIZED` child, on purpose. The bill derivation and every shadow delete handle parent + children (`withoutShadowRows`; the DB cascades on `parent_id`).
+
+**Line → account resolution has three levels** (`resolveLineAccount`): a CFO item rule (`r7_ledger_item_rules`, keyed by normalised item name, vendor-specific beats global), then the Kitchen path (`r7_items.catId` → `r7_ledger_kitchen_category_map`), then null. Rules come first because they exist for exactly the lines Kitchen cannot resolve. Normalisation is deliberately dumb (uppercase, alphanumerics, collapsed spaces), never fuzzy.
+
+**Re-sync reconciles children, it does not append** (`reconcileShadowChildren`): shares that still exist are upserted, stale ones deleted, and a category the operator set by hand on a still-unresolved child survives. Same helper the invoice panel uses.
+
+**The Transactions invoice panel** (`KitchenInvoicePanel`, the ▶ on any Kitchen Sync row) shows the invoice's lines with Kitchen category and resolved account, and lets the operator assign an account to an unresolved line. That writes an item rule (item never mapped in Kitchen) or a Kitchen-category map entry (item has a Kitchen category the CFO has not mapped), then re-splits that invoice's shadow immediately. The CFO never writes into Kitchen tables: the rule decides accounting, not inventory.
 
 ---
 

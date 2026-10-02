@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import { fetchPurchaseBudgetPolicy, savePurchaseBudgetPolicy, fetchPurchaseWeekBudget } from "./lib/supabase.js";
-import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, fetchPurchaseAllocations, prorateAllocation, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
+import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fetchCategories, upsertCategory, deleteCategory, fetchBudgets, upsertBudget, fetchBills, upsertBill, deleteBill, fetchProjects, upsertProject, deleteProject, fetchRecurring, upsertRecurring, deleteRecurring, fetchBankAccounts, upsertBankAccount, deleteBankAccount, fetchKitchenPurchases, fetchKitchenVendors, purchasesToTransactions, fetchMarketingSpend, fetchBookingsForecast, fetchLaborShifts, fetchPosPunchShifts, syncSquareLabor, fetchPayrollRuns, upsertPayrollRun, deletePayrollRun, fetchTipsDaily, syncSquareTips, applyTipPool, syncSquareSales, createPlaidLinkToken, exchangePlaidPublicToken, syncPlaidTransactions, fetchSquarePayouts, syncSquarePayouts, fetchSquareCashDaily, splitTransaction, unsplitTransaction, fetchPurchaseAllocation, fetchPurchaseAllocations, prorateAllocation, fetchPurchaseLines, upsertItemRule, upsertKitchenCategoryMap, buildKitchenShadowRows, reconcileShadowChildren, applyKitchenShadow, bucketsFromLines, fetchAggregatorPayouts, upsertAggregatorPayouts, parseAggregatorStatement, deleteAggregatorPayout, updateAggregatorPayoutDate, onboardFavoBank, fetchFavoBankState, syncFavoBank, transferFavoBank } from "./lib/supabase.js";
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
@@ -1099,6 +1099,15 @@ function DateRangePicker({ dateRange, setDateRange }) {
   );
 }
 
+// Default account for an invoice line nothing resolves. Name first, then any
+// COGS line: a single `find` over "name OR tax_line" used to return "Beverage"
+// because it sorts before "Food & Beverage", and 65 Sysco / US Foods invoices
+// landed as beverage in one month.
+function defaultKitchenCategoryId(categories) {
+  const byName = (categories || []).find(c => c.name === "Food & Beverage");
+  return (byName || (categories || []).find(c => isCogs(c)))?.id || null;
+}
+
 // ─── KITCHEN SYNC BUTTON ──────────────────────────────────────────────────────
 function KitchenSyncButton({ tenantId, categories, dateRange, onSync, showToast }) {
   const [loading, setLoading] = useState(false);
@@ -1121,12 +1130,7 @@ function KitchenSyncButton({ tenantId, categories, dateRange, onSync, showToast 
       const vendorMap = {};
       vendors.forEach(v => { vendorMap[v.id] = v.name; });
 
-      // Default account for an invoice Kitchen cannot break down. Name first,
-      // then any COGS line: a single `find` over "name OR tax_line" used to
-      // return "Beverage" because it sorts before "Food & Beverage", and 65
-      // Sysco / US Foods invoices landed as beverage in one month.
-      const foodBevCat = categories.find(c => c.name === "Food & Beverage")
-        || categories.find(c => isCogs(c));
+      const foodBevCat = { id: defaultKitchenCategoryId(categories) };
 
       // Per-invoice breakdown by ledger account, from Kitchen's line items.
       // Best-effort: if the lookup fails the invoice lands whole in the
@@ -2028,7 +2032,192 @@ async function applyInvoiceSplit(txn, bill, showToast) {
 }
 
 
+// ─── KITCHEN INVOICE PANEL ───────────────────────────────────────────────────
+// Expands under a Sync Kitchen row and shows the invoice the way the operator
+// needs it to categorise: every line, what Kitchen thinks it is, which ledger
+// account the resolver landed on and why. Lines nothing resolves get a
+// dropdown right there. Choosing an account does two things at once:
+//   - records WHY, so the next invoice does not ask again: an item rule
+//     (r7_ledger_item_rules) when the Kitchen scanner never mapped the item,
+//     or a Kitchen-category map entry when the item has a Kitchen category
+//     that the CFO has not mapped yet -- that one settles the whole category;
+//   - re-splits this invoice's shadow immediately (reconcileShadowChildren),
+//     so the Uncategorized child shrinks or disappears without a re-sync.
+// On a child row the lines that make up that child are highlighted.
+//
+// The CFO never writes into Kitchen tables here. Kitchen keeps its inventory
+// as is; the rule only decides the accounting. Those are different jobs.
+function KitchenInvoicePanel({ txn, allTransactions, categories, tenantId, setTransactions, showToast }) {
+  const purchaseId = String(txn.parent_id || txn.id).replace(/^kitchen_purchase_/, "");
+  const parentId = "kitchen_purchase_" + purchaseId;
+  const [state, setState] = useState({ loading: true, data: null, error: null });
+  const [busyIdx, setBusyIdx] = useState(null);
+  const [vendorOnly, setVendorOnly] = useState(false);
+
+  const load = useCallback(async () => {
+    setState(s => ({ ...s, loading: true, error: null }));
+    try {
+      const data = await fetchPurchaseLines(purchaseId, tenantId);
+      setState({ loading: false, data, error: data ? null : "Invoice not found in Kitchen" });
+    } catch (e) {
+      setState({ loading: false, data: null, error: e.message || String(e) });
+    }
+  }, [purchaseId, tenantId]);
+  useEffect(() => { load(); }, [load]);
+
+  const expenseCats = (categories || []).filter(c => c.type === "expense").sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const catName = (id) => (categories || []).find(c => c.id === id)?.name || null;
+
+  // Which lines belong to the row that was expanded: on a child, the lines
+  // whose resolved account is the child's account (or unresolved, for the
+  // uncat child). On the parent, none are singled out.
+  const childAccount = txn.parent_id ? (String(txn.id).endsWith("_alloc_uncat") ? null : String(txn.id).replace(/^.*_alloc_/, "")) : undefined;
+  const isMine = (line) => childAccount === undefined ? false : (childAccount === null ? !line.accountId : line.accountId === childAccount);
+
+  // Re-split the shadow from the current breakdown and push the result into
+  // local state. Mirrors what Sync Kitchen does for every invoice, for one.
+  const resplit = async () => {
+    const fresh = await fetchPurchaseLines(purchaseId, tenantId);
+    if (!fresh) return;
+    const buckets = bucketsFromLines(fresh.lines);
+    const rows = buildKitchenShadowRows(fresh.purchase, fresh.purchase.supplier || "VENDOR PURCHASE", defaultKitchenCategoryId(categories), buckets);
+    const parent = rows[0];
+    const existingParent = (allTransactions || []).find(t => t.id === parentId);
+    const existingChildren = (allTransactions || []).filter(t => t.parent_id === parentId);
+    const { toUpsert, toDelete } = reconcileShadowChildren(rows.slice(1), existingChildren);
+    // Keep whatever the operator did to the parent row itself (reconciled,
+    // notes, account link); only the category follows the breakdown.
+    const parentRow = existingParent ? { ...existingParent, category: parent.category, category_id: parent.category_id } : parent;
+    const res = await applyKitchenShadow(parentRow, toUpsert, toDelete, tenantId);
+    if (!res.ok) { showToast?.("Re-split failed: " + (res.error || "unknown"), "error"); return; }
+    const saved = new Map([parentRow, ...toUpsert].map(t => [t.id, { ...t, category: t.category || t.category_id || UNCATEGORIZED }]));
+    const del = new Set(toDelete);
+    setTransactions?.(prev => {
+      const kept = prev.filter(t => !del.has(t.id)).map(t => saved.has(t.id) ? { ...t, ...saved.get(t.id) } : t);
+      const ids = new Set(kept.map(t => t.id));
+      return [...[...saved.values()].filter(t => !ids.has(t.id)), ...kept];
+    });
+    setState({ loading: false, data: fresh, error: null });
+  };
+
+  const assign = async (line, accountId) => {
+    if (!accountId || accountId === UNCATEGORIZED) return;
+    setBusyIdx(line.idx);
+    try {
+      let res;
+      if (line.kitchenCatId && !line.accountId) {
+        // Kitchen knows the category; the CFO just never mapped it.
+        res = await upsertKitchenCategoryMap(line.kitchenCatId, accountId, tenantId);
+        if (res.ok) showToast?.(`Kitchen category "${line.kitchenCatName}" → ${catName(accountId)} · applies to every item in it`, "success");
+      } else {
+        res = await upsertItemRule({ itemName: line.name, vendorName: vendorOnly ? state.data?.purchase?.supplier : null, ledgerAccountId: accountId }, tenantId);
+        if (res.ok) showToast?.(`"${line.name}" → ${catName(accountId)}${vendorOnly ? ` · ${state.data?.purchase?.supplier} only` : " · every vendor"}`, "success");
+      }
+      if (!res.ok) { showToast?.("Could not save: " + (res.error || "unknown"), "error"); return; }
+      await resplit();
+    } finally {
+      setBusyIdx(null);
+    }
+  };
+
+  const { loading, data, error } = state;
+  const unresolved = (data?.lines || []).filter(l => !l.accountId).length;
+  const linesTotal = (data?.lines || []).reduce((s, l) => s + (parseFloat(l.landed) || 0), 0);
+
+  return (
+    <div style={{ padding: "10px 14px 12px 44px", borderTop: "1px dashed var(--border)" }}>
+      {loading && <div style={{ fontSize: 11, color: "var(--text3)", fontFamily: "var(--font-mono)" }}>Loading invoice lines…</div>}
+      {!loading && error && <div style={{ fontSize: 11, color: "var(--red)" }}>{error}</div>}
+      {!loading && data && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--text3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Kitchen invoice · {data.purchase.supplier || "vendor"} · {fmtDate(data.purchase.date)} · {data.lines.length} line{data.lines.length === 1 ? "" : "s"}
+            </div>
+            {unresolved > 0
+              ? <span className="tag" style={{ fontSize: 10, background: "var(--yellowBg)", color: "var(--yellow)", border: "1px solid var(--yellow)40" }}>{unresolved} line{unresolved === 1 ? "" : "s"} without an account</span>
+              : <span className="tag" style={{ fontSize: 10, background: "var(--accentBg)", color: "var(--accent)", border: "1px solid var(--accent)40" }}>every line resolved</span>}
+            {unresolved > 0 && (
+              <label style={{ fontSize: 11, color: "var(--text3)", display: "flex", alignItems: "center", gap: 6, marginLeft: "auto", cursor: "pointer" }} title="Off: the rule applies to this item name from any vendor. On: only when it comes from this vendor.">
+                <input type="checkbox" checked={vendorOnly} onChange={e => setVendorOnly(e.target.checked)} />
+                rule for {data.purchase.supplier || "this vendor"} only
+              </label>
+            )}
+          </div>
+          <table style={{ fontSize: 11, width: "100%" }}>
+            <thead>
+              <tr style={{ color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                <th style={{ textAlign: "left", fontWeight: 400, padding: "2px 6px" }}>Item</th>
+                <th style={{ textAlign: "right", fontWeight: 400, padding: "2px 6px" }}>Qty</th>
+                <th style={{ textAlign: "right", fontWeight: 400, padding: "2px 6px" }}>Cost</th>
+                <th style={{ textAlign: "left", fontWeight: 400, padding: "2px 6px" }}>Kitchen category</th>
+                <th style={{ textAlign: "left", fontWeight: 400, padding: "2px 6px" }}>Ledger account</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.lines.map(line => {
+                const mine = isMine(line);
+                return (
+                  <tr key={line.idx} style={{ background: mine ? "var(--accentBg)" : "transparent" }}>
+                    <td style={{ padding: "3px 6px", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: mine ? "var(--text)" : "var(--text2)" }} title={line.name}>{line.name}</td>
+                    <td className="mono text-right" style={{ padding: "3px 6px", color: "var(--text3)", whiteSpace: "nowrap" }}>{line.qty}{line.unit ? ` ${line.unit}` : ""}</td>
+                    <td className="mono text-right" style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>{fmt(line.landed)}</td>
+                    <td style={{ padding: "3px 6px", color: line.kitchenCatName ? "var(--text2)" : "var(--text3)", whiteSpace: "nowrap" }}>
+                      {line.kitchenCatName || (line.mappedItemId ? "mapped item, no category" : "not mapped in Kitchen")}
+                    </td>
+                    <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>
+                      {line.accountId ? (
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ color: "var(--text)" }}>{catName(line.accountId) || "—"}</span>
+                          <span className="tag" style={{ fontSize: 9, color: "var(--text3)", background: "var(--surface3)", border: "1px solid var(--border)" }}
+                            title={line.resolvedBy === "rule" ? "Set here, in the invoice panel" : "From the Kitchen category map"}>
+                            {line.resolvedBy === "rule" ? "rule" : "Kitchen map"}
+                          </span>
+                        </span>
+                      ) : (
+                        <select
+                          className="cat-select"
+                          value=""
+                          disabled={busyIdx === line.idx}
+                          onChange={e => assign(line, e.target.value)}
+                          title={line.kitchenCatId ? `Map Kitchen category "${line.kitchenCatName}" to an account` : `Create a rule: "${line.name}" → account`}
+                        >
+                          <option value="">{busyIdx === line.idx ? "Saving…" : "Assign account…"}</option>
+                          {expenseCats.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                        </select>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              <tr style={{ color: "var(--text3)", fontFamily: "var(--font-mono)", fontSize: 10 }}>
+                <td style={{ padding: "4px 6px" }} colSpan={2}>Lines total vs invoice</td>
+                <td className="text-right" style={{ padding: "4px 6px", whiteSpace: "nowrap" }}>{fmt(linesTotal)} / {fmt(data.purchase.total)}</td>
+                <td colSpan={2} style={{ padding: "4px 6px" }}>
+                  {Math.abs(linesTotal - data.purchase.total) > 0.02 ? "Shares are prorated to the invoice total." : ""}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Transactions({ transactions, allTransactions, setTransactions, saveTransactions, deleteTxn, categories, recurring, bankAccounts, bills = [], setBills, saveBill, tenantId, dateRange, setDateRange, showToast, payrollRuns = [] }) {
+  // Kitchen invoice panel — a row from Sync Kitchen (parent or split child)
+  // expands to show the invoice's line items and lets the operator assign an
+  // account to the ones nothing resolves. Keyed by row id; several can be open.
+  const [expandedKitchen, setExpandedKitchen] = useState(() => new Set());
+  const toggleKitchenPanel = (id) => setExpandedKitchen(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
   // Split modal state — opens when the operator clicks ⫶ on a row.
   const [splittingTxn, setSplittingTxn] = useState(null);
   const handleOpenSplit = (id) => {
@@ -2670,7 +2859,8 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
               {filtered.length === 0 ? (
                 <tr><td colSpan={7}><div className="empty"><div className="empty-icon">🔍</div><div className="empty-title">No transactions found</div></div></td></tr>
               ) : filtered.map(t => (
-                <tr key={t.id}>
+                <Fragment key={t.id}>
+                <tr>
                   <td className="mono" style={{ color: "var(--text2)", whiteSpace: "nowrap" }}>{fmtDate(t.date)}</td>
                   <td style={{ maxWidth: 320 }}>
                     <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.description}</div>
@@ -2794,6 +2984,16 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
                     </div>
                   </td>
                   <td style={{ whiteSpace: "nowrap" }}>
+                    {t.source === "kitchen_purchase" && (
+                      <button
+                        className="btn btn-ghost"
+                        style={{ padding: "4px 6px", color: expandedKitchen.has(t.id) ? "var(--accent)" : "var(--text3)", marginRight: 2 }}
+                        title={expandedKitchen.has(t.id) ? "Hide invoice line items" : "Show the Kitchen invoice line items and assign accounts to the unresolved ones"}
+                        onClick={() => toggleKitchenPanel(t.id)}
+                      >
+                        <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, lineHeight: 1, display: "inline-block", transform: expandedKitchen.has(t.id) ? "rotate(90deg)" : "none", transition: "transform 0.12s" }}>▶</span>
+                      </button>
+                    )}
                     {canMatch(t) && (
                       <button
                         className="btn btn-ghost"
@@ -2817,6 +3017,21 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
                     </button>
                   </td>
                 </tr>
+                {expandedKitchen.has(t.id) && (
+                  <tr>
+                    <td colSpan={7} style={{ padding: 0, background: "var(--surface2)" }}>
+                      <KitchenInvoicePanel
+                        txn={t}
+                        allTransactions={allTransactions || transactions}
+                        categories={categories}
+                        tenantId={tenantId}
+                        setTransactions={setTransactions}
+                        showToast={showToast}
+                      />
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -10988,34 +11203,74 @@ export default function App() {
 
   // ── Kitchen sync handler ────────────────────────────────────
   // Sync Kitchen writes one shadow per invoice (plus split children when the
-  // line items span accounts -- see purchasesToTransactions). Two things it
-  // must NOT do:
-  //   - Re-create a shadow the bill flow already removed. Auto-reconcile,
+  // line items span accounts -- see buildKitchenShadowRows). Three rules:
+  //   - Never re-create a shadow the bill flow already removed. Auto-reconcile,
   //     match-invoice and Pay Bill all delete the shadow once the bank debit
-  //     is the record; a sync that only checks "is this id in the ledger?"
+  //     is the record; a sync that only checked "is this id in the ledger?"
   //     brought it straight back, and the P&L counted the invoice twice.
   //     TorresBee had $17k of that across Jul-Sep 2026.
-  //   - Re-add an invoice the operator deleted by hand. Same test covers it
-  //     only when a paid bill exists; a bare delete still comes back, which
-  //     is the pre-existing behaviour.
+  //   - A parent that already exists gets its children RECONCILED, not
+  //     appended: the breakdown changes when an item earns a rule or a Kitchen
+  //     category gets mapped, and the stale slice has to go. A category the
+  //     operator set by hand on a still-unresolved child survives.
+  //   - A bare manual delete of a shadow still comes back on the next sync;
+  //     only a paid bill protects it. Pre-existing behaviour, left as is.
   const handleKitchenSync = async (imported) => {
     const linked = applyAccountLink(imported, bankAccounts);
     const paidPurchases = paidKitchenPurchaseIds(bills);
     const purchaseIdOf = (t) => String(t.parent_id || t.id).replace(/^kitchen_purchase_/, "");
     const live = linked.filter(t => !paidPurchases.has(purchaseIdOf(t)));
 
-    const existingIds = new Set(transactions.map(t => t.id));
-    const newOnes = live.filter(t => !existingIds.has(t.id));
-    // A parent that already exists but is gaining children now was synced
-    // before line-item splitting: re-save it so its category follows the
-    // breakdown (it used to say "Beverage" for a Sysco invoice).
-    const newChildParents = new Set(newOnes.filter(t => t.parent_id).map(t => t.parent_id));
-    const refreshed = live.filter(t => !t.parent_id && existingIds.has(t.id) && newChildParents.has(t.id));
-    const toSave = [...refreshed, ...newOnes];
-    if (toSave.length === 0) return;
-    const refreshedById = new Map(refreshed.map(t => [t.id, t]));
-    setTransactions(prev => [...newOnes, ...prev.map(t => refreshedById.has(t.id) ? { ...t, ...refreshedById.get(t.id) } : t)]);
+    const defaultCat = defaultKitchenCategoryId(categories);
+    const existingById = new Map(transactions.map(t => [t.id, t]));
+    const existingChildrenOf = new Map();
+    for (const t of transactions) {
+      if (t.parent_id && t.source === "kitchen_purchase") {
+        if (!existingChildrenOf.has(t.parent_id)) existingChildrenOf.set(t.parent_id, []);
+        existingChildrenOf.get(t.parent_id).push(t);
+      }
+    }
+    const desiredChildrenOf = new Map();
+    for (const t of live) if (t.parent_id) {
+      if (!desiredChildrenOf.has(t.parent_id)) desiredChildrenOf.set(t.parent_id, []);
+      desiredChildrenOf.get(t.parent_id).push(t);
+    }
+
+    const toSave = [];
+    const toDelete = [];
+    for (const parent of live.filter(t => !t.parent_id)) {
+      const existing = existingChildrenOf.get(parent.id) || [];
+      const { toUpsert, toDelete: stale } = reconcileShadowChildren(desiredChildrenOf.get(parent.id) || [], existing);
+      const prevParent = existingById.get(parent.id);
+      const isNew = !prevParent;
+      const childrenChanged = stale.length > 0
+        || toUpsert.some(c => { const prev = existingById.get(c.id); return !prev || Math.abs(parseFloat(prev.amount) - parseFloat(c.amount)) > 0.004 || (prev.category || UNCATEGORIZED) !== (c.category || UNCATEGORIZED); });
+      // The parent's category follows the breakdown too (it used to say
+      // "Beverage" for a Sysco invoice). Only when the breakdown actually
+      // knows something: a parent that fell back to the default keeps whatever
+      // the operator set, same rule as the children.
+      const breakdownKnows = (desiredChildrenOf.get(parent.id) || []).length > 0 || (parent.category && parent.category !== defaultCat);
+      const parentChanged = !isNew && breakdownKnows && (prevParent.category || UNCATEGORIZED) !== (parent.category || UNCATEGORIZED);
+      if (!isNew && !childrenChanged && !parentChanged) continue;
+      // Parent first: parent_id is a foreign key onto the same table. An
+      // existing parent keeps what the operator did to the row itself
+      // (reconciled, notes, account link); only the category is refreshed.
+      toSave.push(prevParent ? { ...prevParent, category: parent.category, category_id: parent.category_id } : parent, ...toUpsert);
+      toDelete.push(...stale);
+    }
+    if (toSave.length === 0 && toDelete.length === 0) return;
+
+    const savedById = new Map(toSave.map(t => [t.id, t]));
+    const deleteSet = new Set(toDelete);
+    setTransactions(prev => {
+      const kept = prev.filter(t => !deleteSet.has(t.id)).map(t => savedById.has(t.id) ? { ...t, ...savedById.get(t.id) } : t);
+      const keptIds = new Set(kept.map(t => t.id));
+      return [...toSave.filter(t => !keptIds.has(t.id)), ...kept];
+    });
     await saveTransactions(toSave);
+    if (toDelete.length > 0 && TENANT_ID !== "demo") {
+      for (const id of toDelete) deleteTransaction(id).catch(e => console.error("kitchen sync: delete stale child", id, e));
+    }
   };
 
   // ── Marketing sync handler ──────────────────────────────────

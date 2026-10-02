@@ -58,7 +58,7 @@ TorresBee living in the app surfaces the bugs no sweep finds. Flag anything off 
 **Pending operator actions:**
 - Re-sync Tips/Sales/Labor after each deploy to refresh Square data.
 - Compare Payroll run vs Paychex stub at period close (15th) to calibrate the 15% employer-burden rate and spot salaried/off-system gaps.
-- Apply `supabase_cleanup_kitchen_shadow_dupes.sql` (Kitchen shadows with a paid bill, Jul–Sep 2026, ~$17k) and re-run Sync Kitchen so existing invoices get their line-item split.
+- ~~Apply `supabase_cleanup_kitchen_shadow_dupes.sql`~~ done 29/09. Re-run Sync Kitchen after each deploy that touches the split; open the ▶ panel on any Uncategorized Kitchen Sync row to assign the item.
 
 ---
 
