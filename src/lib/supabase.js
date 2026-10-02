@@ -1385,6 +1385,10 @@ export function buildKitchenShadowRows(p, vendor, foodBevCategoryId, buckets) {
     reconciled: false,
     source: 'kitchen_purchase',
     notes: p.invoice_path ? 'Invoice: ' + p.invoice_path : '',
+    // True when the breakdown actually resolved an account (even a single
+    // one), so a re-sync may move a parent off a stale default. Not a column;
+    // upsertTransactions maps known fields only.
+    _resolved: !!(lead && lead.categoryId),
   }
   if (shares.length < 2) return [parent]
   const children = shares.map(sh => ({

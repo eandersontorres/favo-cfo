@@ -58,7 +58,7 @@ TorresBee living in the app surfaces the bugs no sweep finds. Flag anything off 
 **Pending operator actions:**
 - Re-sync Tips/Sales/Labor after each deploy to refresh Square data.
 - Upload the Paychex payroll journal PDF at each period close (1st and 16th). The paystub is the P&L's labor; the Payroll screen settles the bank legs and shows any check still to clear. Jul–Aug 2026 paystubs are still missing, so those months' labor is cash-basis from the bank rows.
-- ~~Apply `supabase_cleanup_kitchen_shadow_dupes.sql`~~ done 29/09. Re-run Sync Kitchen after each deploy that touches the split; open the ▶ panel on any Uncategorized Kitchen Sync row to assign the item.
+- Work the **No invoice** tab in Transactions weekly: each row there is a vendor payment counted as COGS on top of its invoice until matched (🧾) or confirmed invoice-less (`no inv`). Open the ▶ panel on any Uncategorized Kitchen Sync row to assign the item.
 
 ---
 

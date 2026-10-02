@@ -676,7 +676,10 @@ function accrualDate(t) {
 //                              paper checks) once the paystub booked the
 //                              period's labor; the paystub_shadow rows are
 //                              what the P&L counts
-const NON_REVENUE_SOURCES = new Set(["internal_transfer", "square_settlement", "aggregator_settlement", "payroll_settlement"]);
+//   - vendor_settlement     → the bank payment of a Kitchen invoice (ACH, card,
+//                              check, Zelle) once matched to its bill; the
+//                              kitchen_purchase shadow is what the P&L counts
+const NON_REVENUE_SOURCES = new Set(["internal_transfer", "square_settlement", "aggregator_settlement", "payroll_settlement", "vendor_settlement"]);
 function isRevenueRelevant(t) {
   return t && !NON_REVENUE_SOURCES.has(t.source);
 }
@@ -738,16 +741,72 @@ function kitchenShadowIdOf(bill) {
   return pid ? "kitchen_purchase_" + pid : null;
 }
 
-// Purchase ids whose bill is already paid. Sync Kitchen skips these so a
-// settled invoice does not come back as a shadow.
-function paidKitchenPurchaseIds(bills) {
+// ─── Vendor settlement ───────────────────────────────────────────────────────
+// COGS in the P&L comes from the Kitchen invoice (the kitchen_purchase shadow,
+// split by line item). The bank payment of that invoice is a SETTLEMENT: once
+// matched to its bill it is re-tagged source='vendor_settlement' + tag
+// bill:<bill id>, drops out of the P&L (NON_REVENUE_SOURCES) and stays in Cash
+// Flow and in the Transactions list as the audit trail. Same principle as
+// payroll (the paystub is the source, the bank matches). Decided 02/10/2026.
+//
+// It used to be the other way round -- the shadow was deleted and the bank row
+// counted -- which made every payment that nobody matched a double count: in
+// Sep/2026 $11.3k of vendor payments sat next to the invoices they paid.
+const VENDOR_SETTLEMENT_TAG = "bill:";
+const NO_INVOICE_OK_TAG = "no_invoice_ok";
+function settledBillOf(t) {
+  const tag = (Array.isArray(t?.tags) ? t.tags : []).find(x => typeof x === "string" && x.startsWith(VENDOR_SETTLEMENT_TAG));
+  return tag ? tag.slice(VENDOR_SETTLEMENT_TAG.length) : null;
+}
+// The bank row (and, via `children`, its split children) as the settlement of
+// `bill`. Category: the bill's when the row had none, so the row reads right
+// wherever it is listed; the P&L does not count it either way.
+function settleBankRowForBill(row, bill, children = []) {
+  const tags = (Array.isArray(row.tags) ? row.tags : []).filter(x => !(typeof x === "string" && (x.startsWith(VENDOR_SETTLEMENT_TAG) || x === NO_INVOICE_OK_TAG)));
+  const inheritCat = (!row.category || row.category === UNCATEGORIZED) && bill?.category && bill.category !== UNCATEGORIZED;
+  const settled = {
+    ...row,
+    source: "vendor_settlement",
+    reconciled: true,
+    category: inheritCat ? bill.category : row.category,
+    category_id: inheritCat ? bill.category : (row.category_id || (row.category && row.category !== UNCATEGORIZED ? row.category : null)),
+    tags: [...tags, VENDOR_SETTLEMENT_TAG + bill.id],
+    notes: (row.notes ? row.notes + " · " : "") + `Pays invoice ${bill.vendor} ${bill.dueDate || ""}`.trim(),
+  };
+  const kids = (children || []).filter(c => c.parent_id === row.id).map(c => ({ ...c, source: "vendor_settlement", tags: [...(Array.isArray(c.tags) ? c.tags : []), VENDOR_SETTLEMENT_TAG + bill.id] }));
+  return [settled, ...kids];
+}
+
+// Vendors the Kitchen has invoices for, as uppercase tokens (≥4 chars), from
+// the bills that carry a purchase id. A bank payment to one of them with no
+// matched bill is a payment the P&L may be counting on top of the invoice.
+function kitchenVendorTokens(bills) {
   const out = new Set();
   for (const b of bills || []) {
-    if (b.status !== "paid") continue;
-    const pid = kitchenPurchaseIdOf(b);
-    if (pid) out.add(pid);
+    if (!kitchenPurchaseIdOf(b)) continue;
+    for (const w of String(b.vendor || "").toUpperCase().split(/\s+/)) if (w.length >= 4) out.add(w);
   }
   return out;
+}
+// A bank debit that should be matched to an invoice before it counts as COGS:
+// money out, a bank-side row (not a shadow, not already a settlement, not a
+// split child), filed as COGS or not filed at all, not yet tied to a bill, not
+// confirmed as invoice-less, and either naming a Kitchen vendor or landing on
+// an open bill's amount. Zelle rows carry no vendor, so the amount is what
+// catches them.
+const NEEDS_INVOICE_SOURCES = new Set(["plaid", "csv", "ofx", "pdf", "manual"]);
+function needsInvoice(t, ctx) {
+  if (!t || !(parseFloat(t.amount) < 0) || t.parent_id) return false;
+  if (!NEEDS_INVOICE_SOURCES.has(t.source || "manual")) return false;
+  if (hasTag(t, NO_INVOICE_OK_TAG)) return false;
+  if (ctx.billByTxnId?.has(t.id)) return false;
+  const cat = t.category && t.category !== UNCATEGORIZED ? t.category : null;
+  if (cat && !ctx.cogsCatIds?.has(cat)) return false;
+  const desc = String(t.description || "").toUpperCase();
+  const vendorHit = [...(ctx.vendorTokens || [])].some(w => desc.includes(w));
+  if (vendorHit) return true;
+  const amt = Math.abs(parseFloat(t.amount) || 0);
+  return (ctx.openBills || []).some(b => Math.abs(amt - (parseFloat(b.amount) || 0)) <= Math.max(1, amt * 0.01));
 }
 
 // Split a set of ledger rows into income and expense totals. Which side a row
@@ -1994,47 +2053,6 @@ function SplitModal({ txn, categories, payrollRuns = [], onClose, onSave, transa
 }
 
 // ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
-  // Carry the Kitchen invoice's line-item breakdown onto the BANK row as split
-// children. This has to live on the bank transaction, not on the
-// kitchen_purchase shadow: the shadow is deleted the moment the debit
-// reconciles, and the split would go with it.
-//
-// Best-effort by design. A failed allocation leaves the transaction exactly
-// as the single-category path left it -- the invoice is still marked paid and
-// the row still reconciled. Bookkeeping that half-applies is worse than
-// bookkeeping that does not apply.
-async function applyInvoiceSplit(txn, bill, showToast) {
-  const purchaseId = kitchenPurchaseIdOf(bill);
-  if (!purchaseId) return;
-  try {
-    const buckets = await fetchPurchaseAllocation(purchaseId, TENANT_ID);
-    const rows = prorateAllocation(buckets, Math.abs(txn.amount));
-    if (rows.length < 2) return;   // one category is not a split
-    const children = rows.map(r => ({
-      date: txn.date,
-      description: txn.description,
-      amount: txn.amount < 0 ? -Math.abs(r.amount) : Math.abs(r.amount),
-      category: r.categoryId || UNCATEGORIZED,
-      account: txn.account,
-      account_id: txn.accountId || txn.account_id || null,
-      reconciled: true,
-      source: "kitchen_split",
-      notes: `From invoice ${bill.vendor}`,
-    }));
-    const res = await splitTransaction(txn.id, children, TENANT_ID);
-    if (res?.ok) {
-      const unmapped = rows.filter(r => !r.categoryId).length;
-      showToast(
-        `Split into ${rows.length} categories from the invoice` +
-        (unmapped ? " — 1 uncategorized, needs a look" : ""),
-        unmapped ? "info" : "success"
-      );
-    }
-  } catch (e) {
-    console.error("applyInvoiceSplit", e);
-  }
-}
-
 
 // ─── KITCHEN INVOICE PANEL ───────────────────────────────────────────────────
 // Expands under a Sync Kitchen row and shows the invoice the way the operator
@@ -2362,11 +2380,21 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     return true;
   });
 
+  // "No invoice": vendor payments the P&L is counting as COGS without a
+  // matched Kitchen invoice. Match them (🧾) or confirm there is no invoice.
+  const needsInvoiceCtx = useMemo(() => ({
+    billByTxnId: new Map((bills || []).filter(b => b.status === "paid" && b.txnId).map(b => [b.txnId, b])),
+    openBills: (bills || []).filter(b => b.status !== "paid"),
+    vendorTokens: kitchenVendorTokens(bills),
+    cogsCatIds: new Set((categories || []).filter(c => isCogs(c)).map(c => c.id)),
+  }), [bills, categories]);
+
   const matchesTab = (t, f) => {
     if (f === "income") return t.amount > 0;
     if (f === "expense") return t.amount < 0;
     if (f === "uncat") return !t.category || t.category === UNCATEGORIZED;
     if (f === "cat") return !!t.category && t.category !== UNCATEGORIZED;
+    if (f === "needinv") return needsInvoice(t, needsInvoiceCtx);
     return true;
   };
 
@@ -2374,6 +2402,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
 
   const tabCounts = {
     uncat:   scoped.filter(t => matchesTab(t, "uncat")).length,
+    needinv: scoped.filter(t => matchesTab(t, "needinv")).length,
     cat:     scoped.filter(t => matchesTab(t, "cat")).length,
     income:  scoped.filter(t => matchesTab(t, "income")).length,
     expense: scoped.filter(t => matchesTab(t, "expense")).length,
@@ -2650,7 +2679,19 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
   // Whether a row can be matched at all. The icon in the actions column is easy
   // to miss, so a row with a plausible invoice advertises it under the
   // description — that is the one operators actually see.
-  const canMatch = (t) => t.amount < 0 && t.source !== "kitchen_purchase" && !billByTxnId.has(t.id);
+  const canMatch = (t) => t.amount < 0 && t.source !== "kitchen_purchase" && t.source !== "vendor_settlement" && t.source !== "payroll_settlement" && !billByTxnId.has(t.id);
+
+  // The operator looked and there is no Kitchen invoice behind this payment:
+  // it is a real expense on its own. Tagged so the "No invoice" tab stops
+  // asking; the tag is cleared if a match is made later.
+  const confirmNoInvoice = (id) => {
+    setTransactions(prev => {
+      const updated = prev.map(t => t.id === id ? { ...t, tags: [...(Array.isArray(t.tags) ? t.tags : []), NO_INVOICE_OK_TAG] } : t);
+      if (saveTransactions) saveTransactions(updated.filter(t => t.id === id));
+      return updated;
+    });
+    showToast("Kept as an expense without invoice", "info");
+  };
 
   // A suggestion needs an anchor AND a date that is at least in the same season.
   //
@@ -2690,25 +2731,15 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     saveBill?.(paid);
 
     // The Kitchen invoice shadow and the bank debit are the same expense. The
-    // bank row is the system of record, so the shadow goes — the same rule the
-    // Bills auto-reconcile follows, and without it the P&L counts it twice.
-    const shadowId = kitchenShadowIdOf(bill) !== txn.id ? kitchenShadowIdOf(bill) : null;
-    const inheritCat = (!txn.category || txn.category === UNCATEGORIZED)
-      && bill.category && bill.category !== UNCATEGORIZED;
-    const updated = {
-      ...txn,
-      reconciled: true,
-      category: inheritCat ? bill.category : txn.category,
-      autoCategorized: false,
-      notes: (txn.notes ? txn.notes + " · " : "") + `Pays invoice ${bill.vendor} ${bill.dueDate}`,
-    };
-    setTransactions(prev => withoutShadowRows(prev, shadowId)
-      .map(t => (t.id === txn.id ? updated : t)));
-    saveTransactions?.([updated]);
-    if (shadowId) deleteTxn?.(shadowId);
+    // invoice is the P&L record, so the bank row becomes its settlement — same
+    // rule the auto-reconcile follows. Without one of the two stepping aside
+    // the P&L counts it twice.
+    const settled = settleBankRowForBill({ ...txn, autoCategorized: false }, bill, allTransactions || transactions);
+    const byId = new Map(settled.map(x => [x.id, x]));
+    setTransactions(prev => prev.map(t => byId.get(t.id) || t));
+    saveTransactions?.(settled);
 
-    showToast(`Invoice marked paid — ${bill.vendor} · ${fmt(bill.amount)}`, "success");
-    applyInvoiceSplit(updated, bill, showToast);
+    showToast(`Invoice marked paid — ${bill.vendor} · ${fmt(bill.amount)} · bank row settled`, "success");
     setMatchingTxn(null);
     setInvoiceSearch("");
   };
@@ -2826,9 +2857,9 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
 
       <div className="flex items-center gap-12 mb-16">
         <div className="tabs" style={{ marginBottom: 0 }}>
-          {["uncat", "cat", "income", "expense", "all"].map(f => {
+          {["uncat", "needinv", "cat", "income", "expense", "all"].map(f => {
             const counts = tabCounts;
-            const labels = { uncat: "Uncategorized", cat: "Categorized", income: "Income", expense: "Expenses", all: "All" };
+            const labels = { uncat: "Uncategorized", needinv: "No invoice", cat: "Categorized", income: "Income", expense: "Expenses", all: "All" };
             return (
               <div key={f} className={`tab ${filter === f ? "active" : ""}`} onClick={() => setFilter(f)}>
                 {labels[f]} <span style={{ fontSize: 10, opacity: 0.6, marginLeft: 4 }}>({counts[f]})</span>
@@ -3009,11 +3040,21 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
                     {canMatch(t) && (
                       <button
                         className="btn btn-ghost"
-                        style={{ padding: "4px 6px", color: "var(--text3)", marginRight: 2 }}
-                        title="Match this payment to an open invoice and mark the invoice paid"
+                        style={{ padding: "4px 6px", color: needsInvoice(t, needsInvoiceCtx) ? "var(--yellow)" : "var(--text3)", marginRight: 2 }}
+                        title={needsInvoice(t, needsInvoiceCtx) ? "Payment to a Kitchen vendor with no matched invoice — counted as COGS on top of the invoice until matched. Click to match." : "Match this payment to an open invoice and mark the invoice paid"}
                         onClick={() => { setInvoiceSearch(""); setMatchingTxn(t); }}
                       >
                         <span style={{ fontSize: 12, lineHeight: 1 }}>🧾</span>
+                      </button>
+                    )}
+                    {needsInvoice(t, needsInvoiceCtx) && (
+                      <button
+                        className="btn btn-ghost"
+                        style={{ padding: "4px 6px", color: "var(--text3)", marginRight: 2, fontSize: 10, fontFamily: "var(--font-mono)" }}
+                        title="There is no Kitchen invoice behind this payment — keep it as an expense on its own and stop asking"
+                        onClick={() => confirmNoInvoice(t.id)}
+                      >
+                        no inv
                       </button>
                     )}
                     <button
@@ -5999,105 +6040,9 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
   // in Brazil.
   const METHODS = country().paymentMethods;
 
-  // ─── Auto-reconcile bills against real bank activity ───────────────────────
-  // When the real bank debit shows up (Plaid sync, or an imported BoA statement)
-  // we match it to an open bill by amount + vendor + date and mark the bill paid
-  // automatically — no manual "Pay Bill" click needed. For Kitchen-sourced bills
-  // the synthetic invoice shadow is removed so the expense isn't double-counted;
-  // the real bank transaction stays as the system of record.
-  useEffect(() => {
-    // Bank-side outflows that could be a bill payment (exclude the Kitchen
-    // invoice shadow and the synthetic payment rows we create ourselves).
-    const bankOutflows = transactions.filter(t =>
-      t.amount < 0 &&
-      t.source !== "kitchen_purchase" &&
-      t.source !== "bill_payment" &&
-      !String(t.id).startsWith("payment_")
-    );
-    if (bankOutflows.length === 0) return;
+  // The bill auto-reconcile against bank activity lives in App (it has to run
+  // on every load, not only while this tab is open) — see autoReconcileBills.
 
-    // Txns already tied to a paid bill — never reuse them.
-    const usedTxnIds = new Set(bills.filter(b => b.status === "paid" && b.txnId).map(b => b.txnId));
-
-    const matchBill = (bill) => {
-      const dueTime = new Date(bill.dueDate).getTime();
-      const vTokens = String(bill.vendor || "").toUpperCase().split(/\s+/).filter(w => w.length >= 4);
-      if (vTokens.length === 0) return null; // need a vendor signal to be safe
-      return bankOutflows.find(t => {
-        if (usedTxnIds.has(t.id)) return false;
-        // amount within $1 or 1% (whichever is larger)
-        if (Math.abs(Math.abs(t.amount) - bill.amount) > Math.max(1, bill.amount * 0.01)) return false;
-        // payment lands within ~30 days before the due date and up to 10 after
-        const dt = (new Date(t.date).getTime() - dueTime) / 86400000;
-        if (dt < -30 || dt > 10) return false;
-        const desc = String(t.description || "").toUpperCase();
-        return vTokens.some(w => desc.includes(w));
-      });
-    };
-
-    const paidBills = [];
-    const dropTxnIds = []; // Kitchen invoice shadows to remove
-    const editTxns = [];   // real bank debits to tag with the bill's category
-    // (bank txn, ORIGINAL bill) pairs for the line-item split. Has to be the
-    // original: paidBills[].txnId is overwritten with the bank id below, and
-    // the Kitchen purchase id is only recoverable from the bill's old txnId.
-    const splitJobs = [];
-
-    for (const bill of bills) {
-      if (bill.status === "paid") continue;
-      const m = matchBill(bill);
-      if (!m) continue;
-      usedTxnIds.add(m.id);
-      const method = m.account && m.account !== "Plaid" ? m.account : country().defaultPaymentMethod;
-      paidBills.push({
-        ...bill,
-        status: "paid",
-        paidDate: m.date,
-        paidMethod: method,
-        txnId: m.id,
-        notes: (bill.notes ? bill.notes + " · " : "") + "Auto-matched to bank transaction",
-      });
-      const shadowId = kitchenShadowIdOf(bill);
-      if (shadowId && shadowId !== m.id) dropTxnIds.push(shadowId);
-      splitJobs.push({ txn: m, bill });
-      const needCat = (!m.category || m.category === UNCATEGORIZED) && bill.category && bill.category !== UNCATEGORIZED;
-      if (needCat) editTxns.push({ ...m, category: bill.category, reconciled: true });
-      else if (!m.reconciled) editTxns.push({ ...m, reconciled: true });
-    }
-
-    if (paidBills.length === 0) return;
-
-    const paidById = new Map(paidBills.map(b => [b.id, b]));
-    setBills(prev => prev.map(b => paidById.get(b.id) || b));
-    paidBills.forEach(b => { if (saveBill) saveBill(b); });
-
-    if (dropTxnIds.length || editTxns.length) {
-      const dropSet = new Set(dropTxnIds);
-      const editMap = new Map(editTxns.map(t => [t.id, t]));
-      setTransactions(prev => withoutShadowRows(prev, dropSet)
-        .map(t => editMap.get(t.id) || t)
-      );
-      if (editTxns.length && saveTransactions) saveTransactions(editTxns);
-      dropTxnIds.forEach(id => { deleteTransaction(id).catch(() => {}); });
-    }
-
-    // Same line-item split the manual match applies, for the rows that got here
-    // without anyone clicking. Sequential on purpose: each call hits Supabase
-    // three times, and a bulk reconcile can carry a dozen bills.
-    (async () => {
-      for (const j of splitJobs) {
-        const t = editTxns.find(x => x.id === j.txn.id) || j.txn;
-        await applyInvoiceSplit(t, j.bill, showToast);
-      }
-    })();
-
-    showToast(
-      paidBills.length === 1
-        ? "Bill auto-paid — " + paidBills[0].vendor + " (" + fmt(paidBills[0].amount) + ")"
-        : paidBills.length + " bills auto-reconciled from bank",
-      "success"
-    );
-  }, [transactions, bills]);
 
   const isOverdue = (b) => b.status !== "paid" && b.dueDate < today();
 
@@ -6138,18 +6083,17 @@ function Bills({ transactions, setTransactions, bills, setBills, saveBill, delet
       category: selected.category || UNCATEGORIZED,
       account: payForm.method,
       reconciled: true,
-      source: "bill_payment",
+      // A Kitchen invoice is already in the P&L through its shadow, so the
+      // payment row is a settlement. A manual bill has no shadow: the payment
+      // row IS its expense.
+      source: kitchenPurchaseIdOf(selected) ? "vendor_settlement" : "bill_payment",
+      tags: kitchenPurchaseIdOf(selected) ? [VENDOR_SETTLEMENT_TAG + selected.id] : [],
       notes: payForm.notes || ("Bill paid via " + payForm.method),
     };
-    // The payment row replaces the Kitchen invoice shadow. This used to drop
-    // the shadow from local state only, so it was back on the next load and
-    // the expense counted twice; the delete has to reach the database.
-    const shadowId = kitchenShadowIdOf(selected);
-    setTransactions(prev => [newTxn, ...withoutShadowRows(prev, shadowId)]);
+    setTransactions(prev => [newTxn, ...prev]);
 
     if (saveBill) saveBill({ ...selected, status: "paid", paidDate: payForm.date, paidMethod: payForm.method, notes: payForm.notes });
     if (saveTransactions) saveTransactions([newTxn]);
-    if (shadowId && TENANT_ID !== "demo") deleteTransaction(shadowId).catch(e => console.error("payBill: delete shadow", e));
     showToast("Bill paid! " + fmt(selected.amount) + " to " + selected.vendor, "success");
     setModal(null);
     setSelected(null);
@@ -8547,11 +8491,17 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   // Categories the settlement needs. Missing ones are reported, not guessed.
   const payrollCat = categories.find(c => c.taxLine === "Wages" || c.tax_line === "Wages") || categories.find(c => c.type === "expense" && /payroll|labor|wage/i.test(c.name || ""));
-  const tipCat     = categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
-  const reimbCat   = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || ""))
-                  || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""));
+  // Name-first lookups. A loose /tip/ picked "Tips Payable" over "Tip
+  // Pass-Through" (the account the Square tips sync credits), and a loose
+  // /office|supplies/ picked "Cleaning Supplies" for reimbursements and the
+  // Paychex fee because it sorts before "Office & Supplies".
+  const tipCat     = categories.find(c => c.type === "transfer" && /pass.?through/i.test(c.name || ""))
+                  || categories.find(c => c.type === "transfer" && /tip/i.test(c.name || ""));
+  const officeCat  = categories.find(c => c.type === "expense" && /^office/i.test(c.name || ""))
+                  || categories.find(c => c.type === "expense" && /office/i.test(c.name || ""));
+  const reimbCat   = categories.find(c => c.type === "expense" && /reimb/i.test(c.name || "")) || officeCat;
   const feeCat     = categories.find(c => c.type === "expense" && /payroll.*fee|service.*fee/i.test(c.name || ""))
-                  || categories.find(c => c.type === "expense" && /office|supplies/i.test(c.name || ""))
+                  || officeCat
                   || categories.find(c => c.type === "expense" && /bank charge|bank.*fee/i.test(c.name || ""));
   const settleCtx = useMemo(() => ({
     payrollCatId: payrollCat?.id || null,
@@ -8794,9 +8744,11 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
 
   const statusColor = { draft: "var(--text2)", approved: "var(--blue)", submitted: "var(--yellow)", reconciled: "var(--accent)", cancelled: "var(--text3)" };
 
-  // Settlement pass on the screen. For every paystub run whose check date has
-  // passed: if the labor shadow is missing, or a bank leg sits in the plan
-  // without the run's tag (a check that cleared since last time), settle it.
+  // Settlement pass on the screen. For every paystub run: if the labor shadow
+  // is missing, book it (the period's labor is known the day the paystub
+  // exists, whatever the check date); and once the check date has passed, if
+  // a bank leg sits in the plan without the run's tag (a check that cleared
+  // since last time), settle it.
   // Converges on its own -- once everything is tagged and the shadow exists
   // there is nothing left to do -- and runs at most once per run per mount so
   // a failing save cannot loop.
@@ -8805,11 +8757,12 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     if (!tenantId || tenantId === "demo") return;
     const today = new Date().toISOString().slice(0, 10);
     const plans = matchPayrollRunsToBank(runs, transactions, settleCtx);
-    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r) && (payrollRunAnchorDate(r) || "9999") <= today);
+    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r));
     for (const r of due) {
       const plan = plans.get(r.id);
       if (!plan) continue;
-      const needs = !plan.shadowExists || plan.unsettledCount > 0;
+      const checkDatePassed = (payrollRunAnchorDate(r) || "9999") <= today;
+      const needs = !plan.shadowExists || (checkDatePassed && plan.unsettledCount > 0);
       if (!needs || settledOnceRef.current.has(r.id)) continue;
       settledOnceRef.current.add(r.id);
       settlePaystubRun(r).then(res => {
@@ -11154,6 +11107,7 @@ export default function App() {
       if (cats.length > 0)  setCategories(cats.map(c => ({ ...c, id: c.name === "Uncategorized" ? UNCATEGORIZED : c.id, taxLine: c.tax_line || "" })));
       if (bgts.length > 0)  setBudgets(bgts.map(b => ({ ...b, categoryId: b.category_id })));
       if (bls.length > 0)   setBills(bls.map(b => ({ ...b, dueDate: b.due_date, issueDate: b.issue_date, txnId: b.txn_id, category: b.category_id, paidDate: b.paid_date, paidMethod: b.paid_method })));
+      billsLoadedRef.current = true;
       if (projs.length > 0) setProjects(projs.map(p => ({ ...p, projectedRevenue: p.projected_revenue })));
       setRecurring(recs);
       setBankAccounts(accs);
@@ -11295,6 +11249,65 @@ export default function App() {
     });
   }, [transactions]);
 
+  // ─── Auto-reconcile bills against bank activity ─────────────────────────
+  // When the real bank debit shows up (Plaid sync, imported statement) match
+  // it to an open bill by amount + vendor token + date window and mark the
+  // bill paid. The bank row becomes the invoice's settlement
+  // (settleBankRowForBill): the Kitchen shadow stays as the P&L record, the
+  // bank row drops out of the P&L and stays in Cash Flow. Lives here, not in
+  // the Bills screen, because an unmatched payment is a double count the day it
+  // lands, whether or not anyone opens that tab.
+  //
+  // Waits for the DB bills to be loaded: a bill the Kitchen bridge already
+  // marked paid must be known before a derived bill is allowed to claim the
+  // same bank row.
+  const billsLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!billsLoadedRef.current || TENANT_ID === "demo") return;
+    const bankOutflows = transactions.filter(t =>
+      t.amount < 0 && !t.parent_id &&
+      !["kitchen_purchase", "bill_payment", "vendor_settlement", "payroll_settlement", "paystub_shadow", "payroll_run"].includes(t.source) &&
+      !String(t.id).startsWith("payment_")
+    );
+    if (bankOutflows.length === 0) return;
+    const usedTxnIds = new Set(bills.filter(b => b.status === "paid" && b.txnId).map(b => b.txnId));
+    const matchBill = (bill) => {
+      const dueTime = new Date(bill.dueDate).getTime();
+      const vTokens = String(bill.vendor || "").toUpperCase().split(/\s+/).filter(w => w.length >= 4);
+      if (vTokens.length === 0) return null;
+      return bankOutflows.find(t => {
+        if (usedTxnIds.has(t.id)) return false;
+        if (Math.abs(Math.abs(t.amount) - bill.amount) > Math.max(1, bill.amount * 0.01)) return false;
+        const dt = (new Date(t.date).getTime() - dueTime) / 86400000;
+        if (dt < -30 || dt > 10) return false;
+        const desc = String(t.description || "").toUpperCase();
+        return vTokens.some(w => desc.includes(w));
+      });
+    };
+    const paidBills = [];
+    const settledRows = [];
+    for (const bill of bills) {
+      if (bill.status === "paid") continue;
+      const m = matchBill(bill);
+      if (!m) continue;
+      usedTxnIds.add(m.id);
+      const method = m.account && m.account !== "Plaid" ? m.account : country().defaultPaymentMethod;
+      paidBills.push({ ...bill, status: "paid", paidDate: m.date, paidMethod: method, txnId: m.id,
+        notes: (bill.notes ? bill.notes + " · " : "") + "Auto-matched to bank transaction" });
+      settledRows.push(...settleBankRowForBill(m, bill, transactions));
+    }
+    if (paidBills.length === 0) return;
+    const paidById = new Map(paidBills.map(b => [b.id, b]));
+    setBills(prev => prev.map(b => paidById.get(b.id) || b));
+    paidBills.forEach(b => saveBill(b));
+    const byId = new Map(settledRows.map(t => [t.id, t]));
+    setTransactions(prev => prev.map(t => byId.get(t.id) || t));
+    saveTransactions(settledRows);
+    showToast(paidBills.length === 1
+      ? `Bill auto-paid — ${paidBills[0].vendor} (${fmt(paidBills[0].amount)}) · bank row settled`
+      : `${paidBills.length} bills auto-paid from bank activity · bank rows settled`, "success");
+  }, [transactions, bills]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const saveProject = async (project) => {
     if (TENANT_ID === "demo") return;
     await upsertProject(project, TENANT_ID);
@@ -11312,25 +11325,20 @@ export default function App() {
 
   // ── Kitchen sync handler ────────────────────────────────────
   // Sync Kitchen writes one shadow per invoice (plus split children when the
-  // line items span accounts -- see buildKitchenShadowRows). Three rules:
-  //   - Never re-create a shadow the bill flow already removed. Auto-reconcile,
-  //     match-invoice and Pay Bill all delete the shadow once the bank debit
-  //     is the record; a sync that only checked "is this id in the ledger?"
-  //     brought it straight back, and the P&L counted the invoice twice.
-  //     TorresBee had $17k of that across Jul-Sep 2026.
+  // line items span accounts -- see buildKitchenShadowRows). The shadow is
+  // the P&L's record of the invoice, paid or not: the bank payment becomes a
+  // vendor_settlement when matched (autoReconcileBills, match-invoice, Pay
+  // Bill), so a paid invoice keeps its shadow and is still synced here.
   //   - A parent that already exists gets its children RECONCILED, not
   //     appended: the breakdown changes when an item earns a rule or a Kitchen
   //     category gets mapped, and the stale slice has to go. A category the
   //     operator set by hand on a still-unresolved child survives.
-  //   - A bare manual delete of a shadow still comes back on the next sync;
-  //     only a paid bill protects it. Pre-existing behaviour, left as is.
+  //   - A manual delete of a shadow comes back on the next sync. Delete the
+  //     purchase in Kitchen instead; the CFO mirrors Kitchen.
   const handleKitchenSync = async (imported) => {
     const linked = applyAccountLink(imported, bankAccounts);
-    const paidPurchases = paidKitchenPurchaseIds(bills);
-    const purchaseIdOf = (t) => String(t.parent_id || t.id).replace(/^kitchen_purchase_/, "");
-    const live = linked.filter(t => !paidPurchases.has(purchaseIdOf(t)));
+    const live = linked;
 
-    const defaultCat = defaultKitchenCategoryId(categories);
     const existingById = new Map(transactions.map(t => [t.id, t]));
     const existingChildrenOf = new Map();
     for (const t of transactions) {
@@ -11358,7 +11366,7 @@ export default function App() {
       // "Beverage" for a Sysco invoice). Only when the breakdown actually
       // knows something: a parent that fell back to the default keeps whatever
       // the operator set, same rule as the children.
-      const breakdownKnows = (desiredChildrenOf.get(parent.id) || []).length > 0 || (parent.category && parent.category !== defaultCat);
+      const breakdownKnows = parent._resolved === true || (desiredChildrenOf.get(parent.id) || []).length > 0;
       const parentChanged = !isNew && breakdownKnows && (prevParent.category || UNCATEGORIZED) !== (parent.category || UNCATEGORIZED);
       if (!isNew && !childrenChanged && !parentChanged) continue;
       // Parent first: parent_id is a foreign key onto the same table. An
