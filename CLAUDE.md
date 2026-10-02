@@ -156,7 +156,7 @@ Read from sibling Favo modules:
     - `CEO` (CEO Cockpit — equipment ROI calculator)
     - `Bookkeeper` 🇺🇸 (8 rules-based IRS Schedule C checks, compliance score)
     - `Labor` 🇺🇸 (Square shifts, loaded cost, payroll variance)
-    - `Payroll` 🇺🇸 (nested under Labor — prep + Paychex CSV export, bank vs calculated per run: `matchPayrollRunsToBank()` assigns each Paychex/ADP/Gusto debit to the nearest run within ±7 days, nearest-wins so nothing is counted twice)
+    - `Payroll` 🇺🇸 (nested under Labor — prep + Paychex CSV export; paystub import books the period's labor and settles the bank legs, see **Payroll: the paystub is the P&L source** below)
     - `Tips` 🇺🇸 (nested under Payroll — card tips, auto-grat, pooling)
     - `Projects` (future investments timeline/board/list)
     - `Transactions` (review-first: Uncategorized / Categorized tabs, import drop zone, 🧾 match-invoice → mark bill paid)
@@ -426,6 +426,17 @@ The JSON contract is transport-agnostic on purpose — SendGrid Inbound Parse or
 2. **Post selected** — User selects N transactions, opens modal, picks category/account/notes, confirms
 3. Transactions move from "Unposted" tab to "Posted" tab with `posted_at` timestamp
 4. **Unpost** available for corrections
+
+### Payroll: the paystub is the P&L source
+
+Decided 02/10/2026 (reversing the earlier "Reset A"). Labor in the P&L comes from the **paystub** (Paychex payroll journal PDF today, a Paychex API pull later), not from the bank. The bank rows exist to be **matched** against it.
+
+- **Booking.** Saving a paystub (and the pass that runs whenever the Payroll screen is open) writes three `paystub_shadow` rows dated the **end of the period worked** (`payrollRunShadowDate`): `paystub_labor_<run>` = true labor cost (wages + employer match) in Payroll/Wages; `paystub_tips_<run>` = tips charged, in the Tip Pass-Through transfer category; `paystub_reimb_<run>` = non-taxable reimbursements. September's labor sits next to September's revenue even when Paychex pays it on 10/05.
+- **Settlement.** The bank legs that paid for it are re-tagged `source='payroll_settlement'` + tag `payroll_settlement:<run id>` and drop out of the P&L (`NON_REVENUE_SOURCES`) while staying in Cash Flow and in the Transactions list. Legs: the Paychex **tax ACH** (found by amount = `total_tax_liability`), the **direct-deposit ACH** (the big remaining Paychex row), and the **paper checks** (`CHECK nnn`, uncategorized / transfer-typed / Payroll, cleared −1…+21 days from the check date) taken in cleared order while they fit `net_pay − direct deposit`. Bank of America prints every Paychex leg as plain `PAYCHEX`, so legs are classified by amount, not wording (`classifyProcessorLegs`). The Paychex **service fee** is the one leg that is a real expense the paystub does not carry: it keeps counting, re-filed under the fee category instead of Wages.
+- **Outstanding.** A check an employee has not cashed yet shows as `awaiting checks` with the amount still to clear; the next pass settles it when it lands. A check that would push the total past the paystub's is listed as skipped, never silently absorbed.
+- **Idempotent and convergent.** Shadows have fixed ids, settled legs carry the run tag and are re-selected first; the on-screen pass only acts when the shadow is missing or a leg is untagged, once per run per mount. `🔀 Settle with bank` on the run re-runs it by hand.
+- **Why `payroll_settlement` had to be added to `NON_REVENUE_SOURCES`:** the earlier version re-tagged rows but never excluded that source, so a settled run counted twice.
+- **Plaid labels checks and payroll batches as account transfers.** `api/plaid-sync.js` no longer trusts the PFC label when the descriptor says check / Zelle / payroll processor (`NEVER_TRANSFER_RE`). $74k of TorresBee payroll had been filed as Internal Transfer, out of the P&L, Jul–Sep 2026. `supabase_fix_payroll_transfer_tags.sql` re-tagged the existing rows (applied 02/10).
 
 ### Bill payment workflow
 
