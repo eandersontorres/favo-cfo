@@ -88,6 +88,10 @@ export const US = {
   // Statement lines that carry a rail but no merchant: the payee is not in the
   // text, so the amount is the only evidence an invoice match can use.
   anonymousDebitRe: /^check\s*#?\s*\d+|\bzelle\b|\bach\b|\bwire\b|online banking|bill\s?pay|\btransfer\b/i,
+  // Words in a vendor's legal name that say nothing about who it is. Dropped
+  // before a bill's vendor is matched against a statement line, so "US
+  // Foods, Inc." is matched on FOODS, not on INC.
+  vendorStopWords: ["THE", "INC", "LLC", "CORP", "CO", "COM", "LTD", "COMPANY", "AND", "OF"],
 
   importedAccountLabel: "Imported · BoA",
 

@@ -115,6 +115,8 @@ export const BR = {
   // Linha do extrato que diz o trilho mas não o favorecido: só o valor serve
   // de evidência para casar com uma nota.
   anonymousDebitRe: /\bpix\b|\bted\b|\bdoc\b|boleto|transfer[êe]ncia|\bdeb\.?\s*aut/i,
+  // Sufixos e conectivos de razão social que não identificam o fornecedor.
+  vendorStopWords: ["LTDA", "ME", "EPP", "EIRELI", "SA", "S/A", "COMERCIO", "COMÉRCIO", "COMERCIAL", "DISTRIBUIDORA", "INDUSTRIA", "INDÚSTRIA", "ALIMENTOS", "PRODUTOS", "DE", "DA", "DO", "DOS", "DAS", "E"],
 
   importedAccountLabel: "Importado",
 
