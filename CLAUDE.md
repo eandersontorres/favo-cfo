@@ -468,6 +468,8 @@ Nothing un-pays a bill yet, on any of the three paths.
 
 **Re-sync reconciles children, it does not append** (`reconcileShadowChildren`): shares that still exist are upserted, stale ones deleted, and a category the operator set by hand on a still-unresolved child survives. Same helper the invoice panel uses.
 
+**Split rows read as one invoice in the Transactions list.** A parent is followed by its children, indented with `↳`, and carries a `⫶ split · N lines · total not counted` badge; a child follows its parent on the Income / Expense tabs (a keg credit inside a beer invoice is part of an expense, whatever its sign) but is judged on its own on the review tabs, where it stands alone and names its invoice. Before this, parent and children were flat sibling rows and a +$150 keg credit sat on the Income tab, which read as a duplicate. Payroll legs carry `🔀 settles payroll <period>` for the same reason `🧾 pays` exists: a row that is out of the P&L should say so.
+
 **The Transactions invoice panel** (`KitchenInvoicePanel`, the ▶ on any Kitchen Sync row) shows the invoice's lines with Kitchen category and resolved account, and lets the operator assign an account to an unresolved line. That writes an item rule (item never mapped in Kitchen) or a Kitchen-category map entry (item has a Kitchen category the CFO has not mapped), then re-splits that invoice's shadow immediately. The CFO never writes into Kitchen tables: the rule decides accounting, not inventory.
 
 ---
