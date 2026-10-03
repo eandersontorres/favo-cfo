@@ -352,6 +352,14 @@ const fmt = (v) => money(v);
 const fmtDate = (s) => ctryDate(s);
 const fmtShort = (s) => ctryDateShort(s);
 
+// A ledger row as Supabase returns it -> the shape the screens use. loadAll
+// and every side-load (Payroll fetching a run's bank window) go through this
+// so a row never reaches state half-mapped (category_id without category,
+// tags null instead of []).
+function mapDbTransaction(t) {
+  return { ...t, category: t.category_id || UNCATEGORIZED, recurring_id: t.recurring_id || null, account_id: t.account_id || null, prior_period: t.prior_period || false, tags: Array.isArray(t.tags) ? t.tags : [] };
+}
+
 // ─── BANK STATEMENT PARSERS (inlined) ───────────────────────────────────────
 
 function parseCSVLine(line) {
@@ -8277,6 +8285,49 @@ function runHasPaystub(run) {
   return (parseFloat(run?.totals?.total_bank_debit) || 0) > 0;
 }
 
+// The stretch of ledger a run's legs can sit in: processor ACH within
+// ±PAYROLL_BANK_WINDOW_DAYS of the check date, checks up to
+// PAYROLL_CHECK_WINDOW.after past it, and the period end where the labor
+// shadow is dated (so shadowExists can be answered from the same rows).
+function payrollRunBankWindow(run) {
+  const anchor = payrollRunAnchorDate(run);
+  if (!anchor) return null;
+  const shift = (iso, days) => {
+    const d = new Date(String(iso).slice(0, 10) + "T12:00:00");
+    if (isNaN(d)) return null;
+    d.setDate(d.getDate() + days);
+    return d.toISOString().slice(0, 10);
+  };
+  const start = shift(anchor, -PAYROLL_BANK_WINDOW_DAYS);
+  const end = shift(anchor, Math.max(PAYROLL_BANK_WINDOW_DAYS, PAYROLL_CHECK_WINDOW.after));
+  if (!start || !end) return null;
+  const shadow = payrollRunShadowDate(run);
+  return { start: shadow && shadow < start ? shadow : start, end };
+}
+// Which windows the screen still has to load. App only fetches the ledger
+// for the date range on screen, so a run paid outside it has no legs to
+// match against -- Jul/Aug paystubs uploaded while September was selected
+// booked their labor but settled nothing, and the P&L counted both. Windows
+// fully inside the loaded range are skipped; the rest are coalesced
+// (biweekly runs overlap into one stretch) so it is one query, not one per
+// run. Returns [{ start, end }] sorted.
+function payrollBankWindowsToFetch(runs, loaded) {
+  const covered = w => !!(loaded?.start && loaded?.end && w.start >= loaded.start && w.end <= loaded.end);
+  const nextDay = iso => { const d = new Date(iso + "T12:00:00"); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10); };
+  const wins = (runs || [])
+    .filter(r => r.status !== "cancelled")
+    .map(payrollRunBankWindow)
+    .filter(w => w && !covered(w))
+    .sort((a, b) => a.start.localeCompare(b.start));
+  const out = [];
+  for (const w of wins) {
+    const last = out[out.length - 1];
+    if (last && w.start <= nextDay(last.end)) { if (w.end > last.end) last.end = w.end; }
+    else out.push({ ...w });
+  }
+  return out;
+}
+
 // Bank of America prints every Paychex leg as plain "PAYCHEX", so the legs are
 // told apart by AMOUNT against the paystub: the one equal to the tax liability
 // is the tax remittance, anything small is the service fee, the big remainder
@@ -8438,7 +8489,7 @@ function PayrollMatchTag({ status, delta }) {
   );
 }
 
-function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransactions, saveTransactions, tenantId, onChange, showToast }) {
+function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransactions, saveTransactions, tenantId, dateRange, onChange, showToast }) {
   const [selectedId, setSelectedId] = useState(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState({
@@ -8752,9 +8803,48 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
   // Converges on its own -- once everything is tagged and the shadow exists
   // there is nothing left to do -- and runs at most once per run per mount so
   // a failing save cannot loop.
+  // Before any of that, make sure the legs are here to be found. App loads
+  // the ledger for the date range on screen only; a run paid outside it is
+  // fetched here, by its own window, and merged into App state (rows already
+  // in state win -- they may carry edits not yet saved). The pass below
+  // waits for these loads: settling against half the window would pin the
+  // shadow and the ACH legs, mark the run done for this mount, and leave the
+  // checks for a manual re-run.
+  const windowKey = w => w.start + ".." + w.end;
+  const windowsStartedRef = useRef(new Set());
+  const windowsLoadedRef = useRef(new Set());
+  const [windowsLoading, setWindowsLoading] = useState(0);
+  const [windowsVersion, setWindowsVersion] = useState(0);
+  useEffect(() => {
+    if (!tenantId || tenantId === "demo") return;
+    const wins = payrollBankWindowsToFetch(runs, dateRange).filter(w => !windowsStartedRef.current.has(windowKey(w)));
+    if (wins.length === 0) return;
+    for (const w of wins) windowsStartedRef.current.add(windowKey(w));
+    setWindowsLoading(n => n + 1);
+    Promise.all(wins.map(w => fetchTransactions(tenantId, w)))
+      .then(results => {
+        const rows = results.flat().map(mapDbTransaction);
+        if (rows.length > 0) {
+          setTransactions?.(prev => {
+            const have = new Set(prev.map(t => t.id));
+            const add = rows.filter(r => !have.has(r.id));
+            return add.length > 0 ? [...prev, ...add] : prev;
+          });
+        }
+      })
+      .catch(e => console.error("payroll bank window", e))
+      .finally(() => {
+        for (const w of wins) windowsLoadedRef.current.add(windowKey(w));
+        setWindowsLoading(n => n - 1);
+        setWindowsVersion(v => v + 1);   // re-run the pass even when nothing new came back
+      });
+  }, [runs, dateRange, tenantId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const windowsPending = payrollBankWindowsToFetch(runs, dateRange).some(w => !windowsLoadedRef.current.has(windowKey(w)));
+
   const settledOnceRef = useRef(new Set());
   useEffect(() => {
     if (!tenantId || tenantId === "demo") return;
+    if (windowsPending) return;
     const today = new Date().toISOString().slice(0, 10);
     const plans = matchPayrollRunsToBank(runs, transactions, settleCtx);
     const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r));
@@ -8769,7 +8859,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
         if (res.ok && res.newlySettled + (plan.shadowExists ? 0 : res.shadows) > 0) showToast(`${r.period_start} → ${r.period_end}: ` + describeSettlement(res), "info");
       }).catch(e => console.error("payroll settle", r.id, e));
     }
-  }, [runs, transactions, settleCtx, tenantId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [runs, transactions, settleCtx, tenantId, windowsPending, windowsVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Manual re-run for the selected run: a late check cleared, a category was
   // created, the first pass hit an error.
@@ -8779,6 +8869,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
       showToast("This run has no paystub data — import a paystub PDF first", "error");
       return;
     }
+    if (windowsPending) { showToast("Still loading this run's bank window — try again in a moment", "info"); return; }
     settledOnceRef.current.delete(selected.id);
     const res = await settlePaystubRun(selected);
     if (!res.ok) { showToast("Nothing to settle yet", "info"); return; }
@@ -8938,7 +9029,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
             </div>
           </div>
 
-          <PayrollBankCompare run={selected} match={selectedMatch} />
+          <PayrollBankCompare run={selected} match={selectedMatch} loading={windowsLoading > 0} />
 
           <div className="card" style={{ padding: 0 }}>
             <div className="table-wrap">
@@ -9022,7 +9113,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
   );
 }
 
-function PayrollBankCompare({ run, match }) {
+function PayrollBankCompare({ run, match, loading }) {
   if (!run) return null;
   const t = run.totals || {};
   const m = match || { rows: { payroll: [], taxes: [], fee: [], checks: [], skippedChecks: [] }, hasBank: false, status: "pending", favoEstimate: round2(t.total_cash_out), processorCalc: round2(t.total_bank_debit), processorLabel: "Processor", calculated: null, calcSource: null, delta: null, deltaPct: null, bankPaid: 0, bankFee: 0, legCount: 0, outstanding: null, expectedChecks: null, checksPaid: 0, settledCount: 0, shadowExists: false, paystub: runHasPaystub(run), anchor: payrollRunAnchorDate(run), shadowDate: payrollRunShadowDate(run) };
@@ -9072,7 +9163,7 @@ function PayrollBankCompare({ run, match }) {
         <div>
           <div style={{ fontFamily: "var(--font-sans)", fontWeight: 700, fontSize: 13 }}>Bank vs calculated</div>
           <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
-            Processor ACH legs within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor || "the pay date"}{m.paystub ? `, plus payroll checks cleared up to ${PAYROLL_CHECK_WINDOW.after} days after it` : ""}. The processor's fee is shown apart — it is a real expense, not payroll.
+            Processor ACH legs within ±{PAYROLL_BANK_WINDOW_DAYS} days of {m.anchor || "the pay date"}{m.paystub ? `, plus payroll checks cleared up to ${PAYROLL_CHECK_WINDOW.after} days after it` : ""}. The processor's fee is shown apart — it is a real expense, not payroll.{loading ? " Loading the bank rows for this window…" : ""}
           </div>
         </div>
         <PayrollMatchTag status={m.status} delta={m.delta} />
@@ -11097,7 +11188,7 @@ export default function App() {
       // async upsertTransactions round-trip yet — exactly what happens when
       // categorising one row triggers a realtime push that fires loadAll
       // before the bulk save settles.
-      const mappedTxns = txns.map(t => ({ ...t, category: t.category_id || UNCATEGORIZED, recurring_id: t.recurring_id || null, account_id: t.account_id || null, prior_period: t.prior_period || false, tags: Array.isArray(t.tags) ? t.tags : [] }));
+      const mappedTxns = txns.map(mapDbTransaction);
       setTransactions(prev => {
         if (mappedTxns.length === 0) return prev;
         const dbIds = new Set(mappedTxns.map(t => t.id));
@@ -11463,7 +11554,7 @@ export default function App() {
       case "bookkeeper":   return <Bookkeeper transactions={filteredByAccrual} allTransactions={transactions} categories={categories} setTransactions={setTransactions} saveTransactions={saveTransactions} tenantId={TENANT_ID} dateRange={dateRange} setScreen={setScreen} showToast={showToast} />;
       case "labor":        return <Labor shifts={laborShifts} transactions={filteredByDate} categories={categories} tenantId={TENANT_ID} dateRange={dateRange} onSync={() => loadAll(true)} showToast={showToast} />;
       case "tips":         return <Tips tipsDaily={tipsDaily} shifts={laborShifts} tenantId={TENANT_ID} dateRange={dateRange} onSync={() => loadAll(false)} showToast={showToast} />;
-      case "payroll":      return <Payroll runs={payrollRuns} shifts={laborShifts} tipsDaily={tipsDaily} transactions={transactions} categories={categories} setTransactions={setTransactions} saveTransactions={saveTransactions} tenantId={TENANT_ID} onChange={() => loadAll(false)} showToast={showToast} />;
+      case "payroll":      return <Payroll runs={payrollRuns} shifts={laborShifts} tipsDaily={tipsDaily} transactions={transactions} categories={categories} setTransactions={setTransactions} saveTransactions={saveTransactions} tenantId={TENANT_ID} dateRange={dateRange} onChange={() => loadAll(false)} showToast={showToast} />;
       case "projects":     return <Projects transactions={filteredByDate} projects={projects} setProjects={setProjects} saveProject={saveProject} deleteProjectDB={async(id)=>{setProjects(p=>p.filter(x=>x.id!==id));if(TENANT_ID!=="demo")await deleteProject(id);}} categories={categories} dateRange={dateRange} />;
       case "dashboard":    return <Dashboard transactions={filteredByAccrual} allTransactions={transactions} categories={categories} budgets={budgets} bankAccounts={bankAccounts} dateRange={dateRange} />;
       case "transactions": return <Transactions transactions={filteredByDate} allTransactions={transactions} setTransactions={setTransactions} saveTransactions={saveTransactions} deleteTxn={async(id)=>{if(TENANT_ID!=="demo")await deleteTransaction(id);}} categories={categories} recurring={recurring} bankAccounts={bankAccounts} bills={bills} setBills={setBills} saveBill={saveBill} tenantId={TENANT_ID} dateRange={dateRange} setDateRange={setDateRange} showToast={showToast} payrollRuns={payrollRuns} />;
