@@ -2398,9 +2398,15 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     cogsCatIds: new Set((categories || []).filter(c => isCogs(c)).map(c => c.id)),
   }), [bills, categories]);
 
+  // A split child sits with its parent on the Income / Expense tabs: a keg
+  // credit inside a beer invoice is part of an expense, not income, however
+  // its sign reads. The review tabs (uncategorized, no-invoice) still look at
+  // the child itself -- that is how an unresolved line gets found.
+  const byIdAll = useMemo(() => new Map((allTransactions || transactions).map(t => [t.id, t])), [allTransactions, transactions]);
+  const tabOf = (t) => (t.parent_id && byIdAll.get(t.parent_id)) || t;
   const matchesTab = (t, f) => {
-    if (f === "income") return t.amount > 0;
-    if (f === "expense") return t.amount < 0;
+    if (f === "income") return tabOf(t).amount > 0;
+    if (f === "expense") return tabOf(t).amount < 0;
     if (f === "uncat") return !t.category || t.category === UNCATEGORIZED;
     if (f === "cat") return !!t.category && t.category !== UNCATEGORIZED;
     if (f === "needinv") return needsInvoice(t, needsInvoiceCtx);
@@ -2408,6 +2414,27 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
   };
 
   const filtered = scoped.filter(t => matchesTab(t, filter));
+
+  // Render order: a parent is followed by its children, indented, so a split
+  // reads as one invoice and not as a duplicate. A child whose parent is not
+  // on this tab (an uncategorized line of an otherwise categorized invoice)
+  // stands alone and says which invoice it belongs to.
+  const displayRows = useMemo(() => {
+    const ids = new Set(filtered.map(t => t.id));
+    const kidsOf = new Map();
+    for (const t of filtered) if (t.parent_id && ids.has(t.parent_id)) {
+      if (!kidsOf.has(t.parent_id)) kidsOf.set(t.parent_id, []);
+      kidsOf.get(t.parent_id).push(t);
+    }
+    const out = [];
+    for (const t of filtered) {
+      if (t.parent_id && ids.has(t.parent_id)) continue;      // emitted under its parent
+      const kids = kidsOf.get(t.id) || [];
+      out.push({ t, depth: 0, kids: kids.length, orphanOf: t.parent_id ? byIdAll.get(t.parent_id) : null });
+      for (const k of kids) out.push({ t: k, depth: 1, kids: 0, orphanOf: null });
+    }
+    return out;
+  }, [filtered, byIdAll]);
 
   const tabCounts = {
     uncat:   scoped.filter(t => matchesTab(t, "uncat")).length,
@@ -2915,12 +2942,36 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
             <tbody>
               {filtered.length === 0 ? (
                 <tr><td colSpan={7}><div className="empty"><div className="empty-icon">🔍</div><div className="empty-title">No transactions found</div></div></td></tr>
-              ) : filtered.map(t => (
+              ) : displayRows.map(({ t, depth, kids, orphanOf }) => (
                 <Fragment key={t.id}>
-                <tr>
-                  <td className="mono" style={{ color: "var(--text2)", whiteSpace: "nowrap" }}>{fmtDate(t.date)}</td>
-                  <td style={{ maxWidth: 320 }}>
-                    <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.description}</div>
+                <tr style={depth > 0 ? { background: "var(--surface2)" } : undefined}>
+                  <td className="mono" style={{ color: depth > 0 ? "var(--text3)" : "var(--text2)", whiteSpace: "nowrap" }}>{depth > 0 ? "" : fmtDate(t.date)}</td>
+                  <td style={{ maxWidth: 320, paddingLeft: depth > 0 ? 28 : undefined }}>
+                    <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: depth > 0 ? "var(--text2)" : undefined }}>
+                      {depth > 0 && <span style={{ color: "var(--text3)", marginRight: 6 }}>↳</span>}{t.description}
+                    </div>
+                    {kids > 0 && (
+                      <div style={{ marginTop: 4, fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text3)" }}
+                        title="This row is the invoice total. The P&L counts the lines under it, which sum to it; the total itself is not counted again.">
+                        ⫶ split · {kids} line{kids === 1 ? "" : "s"} · total not counted
+                      </div>
+                    )}
+                    {orphanOf && (
+                      <div style={{ marginTop: 4, fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--text3)" }}
+                        title="One line of a split invoice. The invoice total is on another tab.">
+                        ↳ line of {orphanOf.description} · {fmt(orphanOf.amount)}
+                      </div>
+                    )}
+                    {t.source === "payroll_settlement" && (() => {
+                      const runId = settlementRunOf(t);
+                      const run = (payrollRuns || []).find(r => r.id === runId);
+                      return (
+                        <div style={{ marginTop: 4, fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--accent)" }}
+                          title="Bank leg of a payroll run. The P&L takes labor from the paystub; this row only settles it and stays in Cash Flow.">
+                          🔀 settles payroll{run ? ` ${run.period_start} → ${run.period_end}` : ""}
+                        </div>
+                      );
+                    })()}
                     {(() => {
                       const paidBill = billByTxnId.get(t.id);
                       if (!paidBill) return null;
