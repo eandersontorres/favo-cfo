@@ -262,4 +262,24 @@ export function paymentMethods() { return active.paymentMethods; }
 // A debit whose statement text names the rail (check, Zelle, Pix...) but not
 // the payee. Such a line can only be matched to an invoice on the amount.
 export function isAnonymousDebit(desc) { return !!active.anonymousDebitRe && active.anonymousDebitRe.test(String(desc || "")); }
+
+// Does a statement line name this vendor? Both sides are cut into tokens on
+// anything that is not a letter, digit or hyphen, hyphens are dropped inside
+// a token (H-E-B = HEB), and the vendor's legal-name filler goes
+// (vendorStopWords). The vendor's LEAD token -- the first one left -- has to
+// appear in the line: equal, or a five-plus character prefix either way.
+// "US FOODSERVICE" names "US Foods", "BRAZILMKT" names "Brazil Market &
+// Cafe", "THE WEBSTAURANT STORE INC" names "WebstaurantStore"; "THE HOME
+// DEPOT" does not name "Restaurant Depot", because the shared word is not
+// the one that identifies it. The old test was desc.includes(wholeToken),
+// which made "AMAZON" miss "Amazon.com" and "US FOODS" miss "US Foods, Inc."
+// (the token was "FOODS,") and left those payments counting on top of their
+// invoices.
+const vendorTokens = (s) => String(s || "").toUpperCase().split(/[^A-Z0-9-]+/).map(w => w.replace(/-/g, "")).filter(w => w.length >= 2);
+export function vendorNamed(desc, vendor) {
+  const stop = new Set(active.vendorStopWords || []);
+  const lead = vendorTokens(vendor).find(w => !stop.has(w) && w.length >= 3);
+  if (!lead) return false;
+  return vendorTokens(desc).some(b => lead === b || (lead.length >= 5 && b.length >= 5 && (lead.startsWith(b) || b.startsWith(lead))));
+}
 export function defaultTimezone() { return active.timezone; }

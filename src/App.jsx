@@ -4,7 +4,7 @@ import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fet
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
-import { initCountry, setCountryFromTenant, country, supports, isCogs, isFood, isBeverage, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount, isAnonymousDebit } from "./lib/country/index.js";
+import { initCountry, setCountryFromTenant, country, supports, isCogs, isFood, isBeverage, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount, isAnonymousDebit, vendorNamed } from "./lib/country/index.js";
 
 // Active tenant: localStorage override (set by the sidebar TenantSwitcher) wins
 // over the deploy's env pin, so one deploy can serve a multi-store manager.
@@ -785,14 +785,16 @@ function settleBankRowForBill(row, bill, children = []) {
   return [settled, ...kids];
 }
 
-// Vendors the Kitchen has invoices for, as uppercase tokens (≥4 chars), from
-// the bills that carry a purchase id. A bank payment to one of them with no
-// matched bill is a payment the P&L may be counting on top of the invoice.
-function kitchenVendorTokens(bills) {
+// Vendors the Kitchen has invoices for, from the bills that carry a purchase
+// id. A bank payment to one of them with no matched bill is a payment the P&L
+// may be counting on top of the invoice. Matched with vendorNamed(), so the
+// statement's short form ("AMAZON", "US FOODSERVICE") still counts.
+function kitchenVendors(bills) {
   const out = new Set();
   for (const b of bills || []) {
     if (!kitchenPurchaseIdOf(b)) continue;
-    for (const w of String(b.vendor || "").toUpperCase().split(/\s+/)) if (w.length >= 4) out.add(w);
+    const v = String(b.vendor || "").trim();
+    if (v) out.add(v);
   }
   return out;
 }
@@ -810,8 +812,7 @@ function needsInvoice(t, ctx) {
   if (ctx.billByTxnId?.has(t.id)) return false;
   const cat = t.category && t.category !== UNCATEGORIZED ? t.category : null;
   if (cat && !ctx.cogsCatIds?.has(cat)) return false;
-  const desc = String(t.description || "").toUpperCase();
-  const vendorHit = [...(ctx.vendorTokens || [])].some(w => desc.includes(w));
+  const vendorHit = [...(ctx.kitchenVendors || [])].some(v => vendorNamed(t.description, v));
   if (vendorHit) return true;
   const amt = Math.abs(parseFloat(t.amount) || 0);
   return (ctx.openBills || []).some(b => Math.abs(amt - (parseFloat(b.amount) || 0)) <= Math.max(1, amt * 0.01));
@@ -2393,7 +2394,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
   const needsInvoiceCtx = useMemo(() => ({
     billByTxnId: new Map((bills || []).filter(b => b.status === "paid" && b.txnId).map(b => [b.txnId, b])),
     openBills: (bills || []).filter(b => b.status !== "paid"),
-    vendorTokens: kitchenVendorTokens(bills),
+    kitchenVendors: kitchenVendors(bills),
     cogsCatIds: new Set((categories || []).filter(c => isCogs(c)).map(c => c.id)),
   }), [bills, categories]);
 
@@ -2655,9 +2656,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     const amountHit = diff <= Math.max(1, amt * 0.01) ? "exact"
       : diff <= Math.max(5, amt * 0.05) ? "near" : null;
 
-    const desc = String(txn.description || "").toUpperCase();
-    const tokens = String(bill.vendor || "").toUpperCase().split(/\s+/).filter(w => w.length >= 4);
-    const vendorHit = tokens.length > 0 && tokens.some(w => desc.includes(w));
+    const vendorHit = vendorNamed(txn.description, bill.vendor);
 
     const days = Math.abs(new Date(txn.date).getTime() - new Date(bill.dueDate).getTime()) / 86400000;
 
@@ -11394,15 +11393,13 @@ export default function App() {
     const usedTxnIds = new Set(bills.filter(b => b.status === "paid" && b.txnId).map(b => b.txnId));
     const matchBill = (bill) => {
       const dueTime = new Date(bill.dueDate).getTime();
-      const vTokens = String(bill.vendor || "").toUpperCase().split(/\s+/).filter(w => w.length >= 4);
-      if (vTokens.length === 0) return null;
+      if (!String(bill.vendor || "").trim()) return null;
       return bankOutflows.find(t => {
         if (usedTxnIds.has(t.id)) return false;
         if (Math.abs(Math.abs(t.amount) - bill.amount) > Math.max(1, bill.amount * 0.01)) return false;
         const dt = (new Date(t.date).getTime() - dueTime) / 86400000;
         if (dt < -30 || dt > 10) return false;
-        const desc = String(t.description || "").toUpperCase();
-        return vTokens.some(w => desc.includes(w));
+        return vendorNamed(t.description, bill.vendor);
       });
     };
     const paidBills = [];
