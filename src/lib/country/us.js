@@ -32,6 +32,12 @@ export const US = {
   // Prime cost = cogsLine + these, so a line missing here understates it.
   laborLines: ["Wages", "Employee Benefits", "Contract Labor", "Pension & Profit-Sharing"],
   rentLine: "Rent",
+  // Food cost vs COGS. Both are COGS-line categories; a beverage category is
+  // one whose NAME says so and does not also say food ("Food & Beverage" is
+  // the mixed default and stays on the food side). Beverage runs 15-25% of
+  // its sales while food runs 28-35%, so a blended number hides either.
+  beverageRe: /beverage|drink|liquor|wine|beer|\bbar\b|soda|coffee/i,
+  foodRe: /food|produce|meat|grocer|ingredient/i,
   reportingLines: {
     incomeLabel: "Income (Part I)",
     expenseLabel: "Expenses (Part II) & COGS (Part III)",

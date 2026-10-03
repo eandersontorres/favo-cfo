@@ -4,7 +4,7 @@ import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fet
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
-import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount, isAnonymousDebit } from "./lib/country/index.js";
+import { initCountry, setCountryFromTenant, country, supports, isCogs, isFood, isBeverage, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount, isAnonymousDebit } from "./lib/country/index.js";
 
 // Active tenant: localStorage override (set by the sidebar TenantSwitcher) wins
 // over the deploy's env pin, so one deploy can serve a multi-store manager.
@@ -3637,6 +3637,11 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
 
   const totalIncome = incomeCats.reduce((s, c) => s + Math.max(0, getAmount(c.id)), 0);
   const totalCOGS = expenseCats.filter(isCogs).reduce((s, c) => s + Math.abs(Math.min(0, getAmount(c.id))), 0);
+  // Food cost is the food slice of COGS, not COGS. Beverage runs at a very
+  // different margin, so the blended number used to hide a food problem (or
+  // invent one: every soda case bought for resale read as "food").
+  const totalFood = expenseCats.filter(isFood).reduce((s, c) => s + Math.abs(Math.min(0, getAmount(c.id))), 0);
+  const totalBeverage = totalCOGS - totalFood;
   const grossProfit = totalIncome - totalCOGS;
   const totalOpex = expenseCats.filter(c => !isCogs(c)).reduce((s, c) => s + Math.abs(Math.min(0, getAmount(c.id))), 0);
   const netIncome = grossProfit - totalOpex;
@@ -3774,9 +3779,11 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
     if (totalIncome <= 0) return null;
     const laborAmt = categories.filter(isLabor)
       .reduce((s, c) => s + Math.abs(getAmount(c.id)), 0);
-    const foodCostPct = (totalCOGS / totalIncome) * 100;
+    const cogsPct = (totalCOGS / totalIncome) * 100;
+    const foodCostPct = (totalFood / totalIncome) * 100;
+    const beverageCostPct = (totalBeverage / totalIncome) * 100;
     const laborPct = (laborAmt / totalIncome) * 100;
-    const primePct = foodCostPct + laborPct;
+    const primePct = cogsPct + laborPct;   // prime cost is ALL of COGS plus labor
     const netMarginPct = (netIncome / totalIncome) * 100;
     const grossMarginPct = (grossProfit / totalIncome) * 100;
     const ebitdaMarginPct = (profitBreakdown.ebitda / totalIncome) * 100;
@@ -3810,8 +3817,8 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
     else if (total >= 40) { band = "Watch";     tone = "var(--yellow)"; }
     else                  { band = "Critical";  tone = "var(--red)"; }
 
-    return { total, band, tone, subScores, foodCostPct, laborPct, primePct, netMarginPct, grossMarginPct };
-  }, [transactions, categories, totalIncome, totalCOGS, netIncome, grossProfit]);
+    return { total, band, tone, subScores, cogsPct, foodCostPct, beverageCostPct, laborPct, primePct, netMarginPct, grossMarginPct };
+  }, [transactions, categories, totalIncome, totalCOGS, totalFood, netIncome, grossProfit]);
 
   // Export the P&L to CSV. Mirrors the on-screen structure: a Period header,
   // then Income / COGS / OpEx blocks with one row per category, then totals,
@@ -4129,12 +4136,14 @@ function PLReport({ transactions, allTransactions, categories, dateRange = {}, s
             const laborAmt = categories.filter(isLabor).reduce((s, c) => s + Math.abs(getAmount(c.id)), 0);
             const rentAmt  = categories.filter(isRent).reduce((s, c) => s + Math.abs(getAmount(c.id)), 0);
             return (
-          <div className="mt-16" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div className="mt-16" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
             {[
-              { label: "Food Cost %", value: totalIncome > 0 ? ((totalCOGS / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (totalCOGS / totalIncome) < 0.35 },
-              { label: "Labor %",     value: totalIncome > 0 ? ((laborAmt / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (laborAmt / totalIncome) < 0.30 },
-              { label: "Rent %",      value: totalIncome > 0 ? ((rentAmt / totalIncome) * 100).toFixed(1) + "%"  : "—", ok: true },
-              { label: "Prime Cost %",value: totalIncome > 0 ? (((totalCOGS + laborAmt) / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && ((totalCOGS + laborAmt) / totalIncome) < 0.60 },
+              { label: "Food Cost %",     value: totalIncome > 0 ? ((totalFood / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (totalFood / totalIncome) < 0.35 },
+              { label: "Beverage Cost %", value: totalIncome > 0 ? ((totalBeverage / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (totalBeverage / totalIncome) < 0.25 },
+              { label: "COGS %",          value: totalIncome > 0 ? ((totalCOGS / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (totalCOGS / totalIncome) < 0.35 },
+              { label: "Labor %",         value: totalIncome > 0 ? ((laborAmt / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && (laborAmt / totalIncome) < 0.30 },
+              { label: "Rent %",          value: totalIncome > 0 ? ((rentAmt / totalIncome) * 100).toFixed(1) + "%"  : "—", ok: true },
+              { label: "Prime Cost %",    value: totalIncome > 0 ? (((totalCOGS + laborAmt) / totalIncome) * 100).toFixed(1) + "%" : "—", ok: totalIncome > 0 && ((totalCOGS + laborAmt) / totalIncome) < 0.60 },
             ].map(s => (
               <div key={s.label} className="card card-sm" style={{ textAlign: "center" }}>
                 <div style={{ fontSize: 10, color: "var(--text3)", fontFamily: "var(--font-mono)", marginBottom: 4 }}>{s.label}</div>
@@ -6405,14 +6414,20 @@ function Insights({ transactions, categories, budgets, recurring = [], tenantId,
   // name-based; the packs do not declare those lines yet.
   const findCatId = (re) => (categories.find(c => re.test(c.name || "")) || {}).id;
   const sumCats  = (pred) => categories.filter(pred).reduce((s, c) => s + getCat(c.id), 0);
-  const foodCost = sumCats(isCogs);
+  // Food cost is the food slice of COGS; beverage is reported on its own and
+  // COGS is the sum. Prime cost takes all of COGS.
+  const foodCost = sumCats(isFood);
+  const bevCost  = sumCats(isBeverage);
+  const cogs     = foodCost + bevCost;
   const labor    = sumCats(isLabor);
   const rent     = sumCats(isRent);
   const marketing= getCat(findCatId(/marketing|advertis/i));
   const insurance= getCat(findCatId(/insurance/i));
   const foodCostPct  = totalIncome > 0 ? (foodCost/totalIncome)*100 : 0;
+  const bevCostPct   = totalIncome > 0 ? (bevCost/totalIncome)*100 : 0;
+  const cogsPct      = totalIncome > 0 ? (cogs/totalIncome)*100 : 0;
   const laborPct     = totalIncome > 0 ? (labor/totalIncome)*100 : 0;
-  const primeCost    = foodCostPct + laborPct;
+  const primeCost    = cogsPct + laborPct;
   const rentPct      = totalIncome > 0 ? (rent/totalIncome)*100 : 0;
   const marketingPct = totalIncome > 0 ? (marketing/totalIncome)*100 : 0;
   const burnRate     = totalExpense / 30;
@@ -6423,6 +6438,7 @@ function Insights({ transactions, categories, budgets, recurring = [], tenantId,
   const alerts = [];
   if (foodCostPct > 35)  alerts.push({ level:"critical", icon:"🚨", title:"Food Cost Critical",    msg:`At ${foodCostPct.toFixed(1)}% — benchmark 28-35%. Losing ${fmt(foodCost - totalIncome*0.32)} vs target.`,  action:"Review portion sizes, supplier contracts, and menu pricing immediately." });
   if (foodCostPct > 28 && foodCostPct <= 35) alerts.push({ level:"warn", icon:"⚠️", title:"Food Cost Elevated", msg:`At ${foodCostPct.toFixed(1)}% — approaching danger zone.`, action:"Audit top 10 menu items for margin. Consider 3-5% price increase on low-margin items." });
+  if (bevCostPct > 25)   alerts.push({ level:"warn", icon:"⚠️", title:"Beverage Cost Elevated", msg:`At ${bevCostPct.toFixed(1)}% — benchmark 15-25%.`, action:"Check pour sizes, drink pricing and whether beverage buys are landing in the right category." });
   if (laborPct > 35)     alerts.push({ level:"critical", icon:"🚨", title:"Labor Cost Critical",   msg:`At ${laborPct.toFixed(1)}% — overspending by ${fmt(labor - totalIncome*0.30)}.`,  action:"Review scheduling. Cut overtime. Cross-train staff for multiple roles." });
   if (primeCost > 65)    alerts.push({ level:"critical", icon:"🚨", title:"Prime Cost Danger",     msg:`Prime cost ${primeCost.toFixed(1)}% — must stay below 65%.`,  action:"Emergency review: reduce food cost AND labor simultaneously." });
   if (netMargin < 5 && totalIncome > 0) alerts.push({ level:"warn", icon:"⚠️", title:"Thin Net Margin", msg:`Net margin ${netMargin.toFixed(1)}% — target 5-10%.`, action:"Focus on revenue growth and cut top 3 expense lines by 10% each." });
@@ -6432,6 +6448,8 @@ function Insights({ transactions, categories, budgets, recurring = [], tenantId,
 
   const benchmarks = [
     { name:"Food Cost %",  value:foodCostPct,  target:32, unit:"%", lower:true,  good:foodCostPct<=32,  warn:foodCostPct<=35 },
+    { name:"Beverage %",   value:bevCostPct,   target:20, unit:"%", lower:true,  good:bevCostPct<=22,   warn:bevCostPct<=25 },
+    { name:"COGS %",       value:cogsPct,      target:32, unit:"%", lower:true,  good:cogsPct<=32,      warn:cogsPct<=35 },
     { name:"Labor Cost %", value:laborPct,     target:30, unit:"%", lower:true,  good:laborPct<=30,     warn:laborPct<=35 },
     { name:"Prime Cost %", value:primeCost,    target:60, unit:"%", lower:true,  good:primeCost<=60,    warn:primeCost<=65 },
     { name:"Net Margin %", value:netMargin,    target:8,  unit:"%", lower:false, good:netMargin>=8,     warn:netMargin>=5 },
@@ -6701,6 +6719,8 @@ function Insights({ transactions, categories, budgets, recurring = [], tenantId,
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
           {[
             {label:"Food Cost",range:"28–35%",yours:foodCostPct.toFixed(1)+"%",ok:foodCostPct<=35},
+            {label:"Beverage Cost",range:"15–25%",yours:bevCostPct.toFixed(1)+"%",ok:bevCostPct<=25},
+            {label:"COGS",range:"28–35%",yours:cogsPct.toFixed(1)+"%",ok:cogsPct<=35},
             {label:"Labor Cost",range:"25–35%",yours:laborPct.toFixed(1)+"%",ok:laborPct<=35},
             {label:"Prime Cost",range:"55–65%",yours:primeCost.toFixed(1)+"%",ok:primeCost<=65},
             {label:"Rent",range:"5–10%",yours:rentPct.toFixed(1)+"%",ok:rentPct<=10},
@@ -10257,6 +10277,7 @@ function Trends({ tenantId, categories, allTransactions }) {
     const mapped = rows.map(t => ({ ...t, category: t.category ?? (t.category_id || UNCATEGORIZED) }));
     const isLedger = makeLedgerFilter(categories, mapped);
     const cogsCatIds = new Set((categories || []).filter(isCogs).map(c => c.id));
+    const foodCatIds = new Set((categories || []).filter(isFood).map(c => c.id));
     const laborCatIds = new Set((categories || []).filter(isLabor).map(c => c.id));
     const findCatIds = (pred) => new Set((categories || []).filter(pred).map(c => c.id));
     const ebitdaAddbackIds = new Set([
@@ -10272,11 +10293,12 @@ function Trends({ tenantId, categories, allTransactions }) {
       const d = accrualDate(t);
       if (!d) continue;
       const key = d.slice(0, 7);
-      if (!byMonth.has(key)) byMonth.set(key, { revenue: 0, expenses: 0, cogs: 0, labor: 0, addbacks: 0 });
+      if (!byMonth.has(key)) byMonth.set(key, { revenue: 0, expenses: 0, cogs: 0, food: 0, labor: 0, addbacks: 0 });
       const m = byMonth.get(key);
       const amt = parseFloat(t.amount || 0);
       if (amt > 0) m.revenue += amt; else m.expenses += -amt;
       if (amt < 0 && cogsCatIds.has(t.category)) m.cogs += -amt;
+      if (amt < 0 && foodCatIds.has(t.category)) m.food += -amt;
       if (amt < 0 && laborCatIds.has(t.category)) m.labor += -amt;
       if (amt < 0 && ebitdaAddbackIds.has(t.category)) m.addbacks += -amt;
     }
@@ -10288,9 +10310,10 @@ function Trends({ tenantId, categories, allTransactions }) {
       const label = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][parseInt(mm, 10) - 1] + " " + yy.slice(2);
       if (m.revenue <= 0) return { key, label, revenue: m.revenue, netIncome: m.revenue - m.expenses };
       const netIncome = m.revenue - m.expenses;
-      const food = (m.cogs / m.revenue) * 100;
+      const cogs = (m.cogs / m.revenue) * 100;
+      const food = (m.food / m.revenue) * 100;      // food slice only, same as the P&L scorecard
       const labor = (m.labor / m.revenue) * 100;
-      const prime = food + labor;
+      const prime = cogs + labor;
       const netMargin = (netIncome / m.revenue) * 100;
       const ebitda = ((netIncome + m.addbacks) / m.revenue) * 100;
       // Operating expenses = everything that is not prime cost and not an EBITDA add-back,
@@ -10299,7 +10322,7 @@ function Trends({ tenantId, categories, allTransactions }) {
       const opex = ((m.expenses - m.cogs - m.labor - m.addbacks) / m.revenue) * 100;
       const vals = { net_margin: netMargin, ebitda, prime, food, labor };
       const score = Math.round(Object.entries(TREND_BENCH).reduce((s, [k, b]) => s + trendNorm(vals[k], b) * b.weight, 0));
-      return { key, label, revenue: m.revenue, netIncome, food, labor, prime, netMargin, ebitda, opex, score };
+      return { key, label, revenue: m.revenue, netIncome, cogs, food, labor, prime, netMargin, ebitda, opex, score };
     });
   }, [rows, categories]);
 

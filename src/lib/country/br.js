@@ -33,6 +33,10 @@ export const BR = {
 
   reportingLineLabel: "Conta do DRE",
   cogsLine: "CMV",
+  // Food cost x CMV: categoria de bebida é a que diz isso no nome e não diz
+  // comida junto ("Insumos e Mercadorias" fica do lado da comida).
+  beverageRe: /bebida|cerveja|vinho|refrigerante|drink|chopp|suco|caf[eé]/i,
+  foodRe: /comida|aliment|insumo|hortifruti|carne|mercadoria/i,
   // No Brasil o custo de pessoal é muito maior que a folha: encargos
   // (INSS, FGTS, rescisões), benefícios (VT, convênio, refeição),
   // adiantamentos e pró-labore. Na ALK o salário puro é 41% do custo real
