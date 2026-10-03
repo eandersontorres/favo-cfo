@@ -79,6 +79,9 @@ export const US = {
 
   paymentMethods: ["Bank Transfer", "Check", "ACH", "Credit Card", "Cash", "Zelle", "Wire Transfer"],
   defaultPaymentMethod: "Bank Transfer",
+  // Statement lines that carry a rail but no merchant: the payee is not in the
+  // text, so the amount is the only evidence an invoice match can use.
+  anonymousDebitRe: /^check\s*#?\s*\d+|\bzelle\b|\bach\b|\bwire\b|online banking|bill\s?pay|\btransfer\b/i,
 
   importedAccountLabel: "Imported · BoA",
 

@@ -250,4 +250,7 @@ export function reportingLines() { return active.reportingLines; }
 export function reportingLineLabel() { return active.reportingLineLabel; }
 export function defaultCategories() { return active.defaultCategories; }
 export function paymentMethods() { return active.paymentMethods; }
+// A debit whose statement text names the rail (check, Zelle, Pix...) but not
+// the payee. Such a line can only be matched to an invoice on the amount.
+export function isAnonymousDebit(desc) { return !!active.anonymousDebitRe && active.anonymousDebitRe.test(String(desc || "")); }
 export function defaultTimezone() { return active.timezone; }

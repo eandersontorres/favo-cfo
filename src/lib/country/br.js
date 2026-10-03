@@ -108,6 +108,9 @@ export const BR = {
   // Pix primeiro: é o trilho dominante, não uma alternativa.
   paymentMethods: ["Pix", "Boleto", "TED", "Débito Automático", "Cartão de Crédito", "Cartão de Débito", "Dinheiro"],
   defaultPaymentMethod: "Pix",
+  // Linha do extrato que diz o trilho mas não o favorecido: só o valor serve
+  // de evidência para casar com uma nota.
+  anonymousDebitRe: /\bpix\b|\bted\b|\bdoc\b|boleto|transfer[êe]ncia|\bdeb\.?\s*aut/i,
 
   importedAccountLabel: "Importado",
 

@@ -4,7 +4,7 @@ import { supabase, fetchTransactions, upsertTransactions, deleteTransaction, fet
 import { UNCATEGORIZED } from "./lib/constants.js";
 import { useAppAccess, lockMessage } from "./lib/appAccess.js";
 import { aiAuthHeaders, getMyCfoTenantIds, signInWithPassword, sendMagicLink, signOutUser, fetchTenant, fetchCeoRoi, saveCeoRoi } from "./lib/supabase.js";
-import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount } from "./lib/country/index.js";
+import { initCountry, setCountryFromTenant, country, supports, isCogs, cogsLine, isLabor, isRent, money, moneyCompact, currencySymbol, formatNumber as ctryNumber, formatDate as ctryDate, formatDateShort as ctryDateShort, formatMonth as ctryMonth, formatTime as ctryTime, parseDate as ctryParseDate, parseAmount as ctryParseAmount, isAnonymousDebit } from "./lib/country/index.js";
 
 // Active tenant: localStorage override (set by the sidebar TenantSwitcher) wins
 // over the deploy's env pin, so one deploy can serve a multi-store manager.
@@ -2669,7 +2669,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     else if (days <= 30) score += 15;
     else if (days <= 90) score += 8;
 
-    return { score, amountHit, vendorHit, days };
+    return { score, amountHit, vendorHit, days, cents: diff <= 0.005 };
   };
 
   const openBills = useMemo(() => (bills || []).filter(b => b.status !== "paid"), [bills]);
@@ -2703,16 +2703,23 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
 
   // A suggestion needs an anchor AND a date that is at least in the same season.
   //
-  // The anchor is the amount on the nose, or the vendor named with the amount
-  // in the neighbourhood; points scraped from a loose amount plus a nearby date
-  // are a coincidence, not an invoice. The horizon is what keeps the anchor
-  // honest: a statement line like "CHECK 951" carries no vendor at all, so a
-  // round $1,200.00 is the only signal there will ever be — and a round amount
-  // matches an invoice from last year just as happily as this month's. Past the
-  // window where the date still earns points, we say nothing.
+  // Two anchors, by what the statement line says:
+  //  - It names the merchant ("APPLE", "WALMART"): that merchant has to be the
+  //    bill's vendor, and then the amount may be exact or near (a fee, a
+  //    rounding). A line naming Apple is never a suggestion for an Amazon
+  //    invoice, whatever the amounts -- that one confused more than it helped.
+  //  - It names only the rail ("CHECK 951", "ZELLE", an ACH): there is no
+  //    vendor to check, so the amount has to match to the cent. $125.00 against
+  //    a $124.95 invoice is a coincidence, not evidence; the old $1 tolerance
+  //    let it through.
+  // Points scraped from a loose amount plus a nearby date never carry a match.
+  // The horizon keeps the anchor honest: a round amount matches an invoice from
+  // last year just as happily as this month's, so past the window where the
+  // date still earns points we say nothing. The modal still ranks every open
+  // bill -- this gate only decides what the row advertises on its own.
   const MATCH_HORIZON_DAYS = 90;
-  const isSuggestable = (g) =>
-    (g.amountHit === "exact" || (g.vendorHit && g.amountHit === "near"))
+  const isSuggestable = (g, txn) =>
+    ((g.vendorHit && !!g.amountHit) || (isAnonymousDebit(txn?.description) && g.cents))
     && isFinite(g.days) && g.days <= MATCH_HORIZON_DAYS;
 
   const bestBillFor = (t) => {
@@ -2720,7 +2727,7 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
     let best = null;
     for (const b of openBills) {
       const g = gradeBill(t, b);
-      if (isSuggestable(g) && (!best || g.score > best.score)) best = { bill: b, ...g };
+      if (isSuggestable(g, t) && (!best || g.score > best.score)) best = { bill: b, ...g };
     }
     return best;
   };
@@ -3150,9 +3157,9 @@ function Transactions({ transactions, allTransactions, setTransactions, saveTran
                   </div>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 340, overflowY: "auto" }}>
-                    {cands.map(({ bill, score, amountHit, vendorHit, days }) => {
+                    {cands.map(({ bill, score, amountHit, vendorHit, days, cents }) => {
                       const delta = txnAmt - Math.abs(parseFloat(bill.amount) || 0);
-                      const ok = isSuggestable({ amountHit, vendorHit, days });
+                      const ok = isSuggestable({ amountHit, vendorHit, days, cents }, matchingTxn);
                       const tone = ok && score >= 90 ? "var(--accent)"
                         : ok ? "var(--yellow)" : "var(--text3)";
                       const label = ok && score >= 90 ? "likely"
