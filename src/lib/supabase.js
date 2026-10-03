@@ -53,6 +53,19 @@ export async function signOutUser() {
   return await supabase.auth.signOut()
 }
 
+// Headers for the /api/* endpoints that run as service role (the sync
+// endpoints). They verify this token and check the user is a member of the
+// tenant being synced — see api/_auth.js. Without it they answer 401, which is
+// the point: they used to be callable by anyone who knew a tenant UUID.
+export async function authHeaders() {
+  const { data } = await supabase.auth.getSession()
+  const token = data?.session?.access_token
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
+}
+
 // ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
 // PostgREST devolve no maximo 1000 linhas por resposta, entao uma consulta sem
 // paginacao NAO devolve erro -- devolve menos dado, calada. Como a ordem e por
@@ -847,7 +860,7 @@ export async function fetchTipsDaily(tenantId, { start, end } = {}) {
 export async function syncSquareSales(tenantId, range = {}) {
   const res = await fetch('/api/sync-square-sales', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await authHeaders(),
     body: JSON.stringify({ tenant_id: tenantId, start: range.start, end: range.end }),
   })
   if (!res.ok) {
@@ -896,7 +909,7 @@ export async function exchangePlaidPublicToken(tenantId, publicToken, institutio
 export async function syncPlaidTransactions(tenantId) {
   const res = await fetch('/api/plaid-sync', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await authHeaders(),
     body: JSON.stringify({ tenant_id: tenantId }),
   })
   if (!res.ok) {
@@ -1065,7 +1078,7 @@ export async function parseAggregatorStatement({ pdfBase64, csvText, filename, p
 export async function syncSquarePayouts(tenantId, range = {}) {
   const res = await fetch('/api/sync-square-payouts', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await authHeaders(),
     body: JSON.stringify({ tenant_id: tenantId, start: range.start, end: range.end }),
   })
   if (!res.ok) {
@@ -1078,7 +1091,7 @@ export async function syncSquarePayouts(tenantId, range = {}) {
 export async function syncSquareTips(tenantId, range = {}) {
   const res = await fetch('/api/sync-square-tips', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await authHeaders(),
     body: JSON.stringify({ tenant_id: tenantId, start: range.start, end: range.end }),
   })
   if (!res.ok) {
@@ -1284,7 +1297,7 @@ export async function syncSquareLabor(tenantId, range = {}) {
   try {
     const res = await fetch('/api/sync-square-labor', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await authHeaders(),
       body: JSON.stringify({ tenant_id: tenantId, start: range.start, end: range.end }),
     })
     if (!res.ok) {

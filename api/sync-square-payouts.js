@@ -14,7 +14,7 @@
 // server-side cron pass that writes `source='square_settlement'` on the
 // matched ledger row + `matched_txn_id` on the payout row.
 
-import { createClient } from "@supabase/supabase-js";
+import { authorizeSync, serviceRoleClient } from "./_auth.js";
 
 const SQUARE_VERSION = "2024-12-18";
 const DEFAULT_LOOKBACK_DAYS = 90;
@@ -22,14 +22,17 @@ const DEFAULT_LOOKBACK_DAYS = 90;
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const url = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !serviceKey) return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured" });
+  const supabase = serviceRoleClient();
+  if (!supabase) return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY not configured" });
 
   const { tenant_id, start, end } = req.body || {};
-  if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
 
-  const supabase = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+  // Before anything tenant-shaped: a logged-in member of this tenant, or the
+  // cron wrapper's CRON_SECRET. See api/_auth.js.
+  const auth = await authorizeSync(req, res, tenant_id, supabase);
+  if (!auth.ok) return;
+
+  if (!tenant_id) return res.status(400).json({ error: "tenant_id required" });
 
   try {
     const { data: tenant } = await supabase.from("r7_tenants").select("settings").eq("id", tenant_id).maybeSingle();
