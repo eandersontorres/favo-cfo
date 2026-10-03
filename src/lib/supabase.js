@@ -1391,12 +1391,17 @@ export function buildKitchenShadowRows(p, vendor, foodBevCategoryId, buckets) {
     _resolved: !!(lead && lead.categoryId),
   }
   if (shares.length < 2) return [parent]
+  // A share keeps its sign: a positive bucket is money spent (negative row),
+  // a negative bucket is a CREDIT on the invoice (returned kegs, a deposit
+  // refunded) and becomes a positive row that reduces that account. The old
+  // -Math.abs() turned a $400 keg-return credit into a $400 expense, and the
+  // children no longer summed to the parent.
   const children = shares.map(sh => ({
     id: `${parentId}_alloc_${sh.categoryId || 'uncat'}`,
     parent_id: parentId,
     date: p.date,
     description: parent.description,
-    amount: -Math.abs(sh.amount),
+    amount: Math.round(-sh.amount * 100) / 100,
     category_id: sh.categoryId || null,
     category: sh.categoryId || UNCATEGORIZED,
     account: 'Kitchen Sync',
