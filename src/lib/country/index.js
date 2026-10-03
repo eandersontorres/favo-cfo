@@ -73,6 +73,15 @@ export function cogsLine() { return active.cogsLine; }
 export function isCogs(cat) {
   return (cat?.taxLine ?? cat?.tax_line) === active.cogsLine;
 }
+// COGS splits into food and beverage by category NAME, since the reporting
+// line is one bucket. A category whose name says both ("Food & Beverage")
+// counts as food: that is the mixed default and food is the bigger half.
+export function isBeverage(cat) {
+  if (!isCogs(cat)) return false;
+  const name = String(cat?.name || "");
+  return !!active.beverageRe && active.beverageRe.test(name) && !(active.foodRe && active.foodRe.test(name));
+}
+export function isFood(cat) { return isCogs(cat) && !isBeverage(cat); }
 
 // Labor is a SET of reporting lines, never a single category: the payroll of a
 // restaurant is split across wages, statutory charges and benefits, and which

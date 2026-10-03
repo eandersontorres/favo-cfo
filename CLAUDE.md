@@ -286,6 +286,9 @@ setTransactions(prev => {
 });
 ```
 
+### 7b. Food cost is the food slice of COGS, not COGS
+`isCogs` is the reporting line (Schedule C Part III / CMV). `isFood` / `isBeverage` split it by category **name** through the pack's `foodRe` / `beverageRe` — "Food & Beverage" counts as food (mixed default), "Beverage" as beverage. Insights, the P&L scorecard and Trends report **Food Cost** (food only, 28–35%), **Beverage Cost** (15–25%) and **COGS** (sum) separately; **Prime Cost** is all of COGS plus labor. Before this split a case of Guaraná read as food cost.
+
 ### 8. Country packs — never hardcode a locale, currency or tax rule
 Anything that changes between markets lives in `src/lib/country/`. Do NOT add `en-US`, `USD`, a `$`, a US date assumption, or an IRS rule to `App.jsx`.
 
