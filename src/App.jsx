@@ -1952,7 +1952,7 @@ function SplitModal({ txn, categories, payrollRuns = [], onClose, onSave, transa
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 720 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div>
@@ -4279,7 +4279,7 @@ function AdjustmentModal({ categories, dateRange = {}, hint = {}, onClose, onSav
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div>
@@ -9297,7 +9297,7 @@ function PaystubPreviewModal({ data, onClose, onSave }) {
     </div>
   );
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div>
@@ -9387,7 +9387,7 @@ function AggregatorPreviewModal({ data, onClose, onSave }) {
   }[platform] || platform;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 820 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div>
