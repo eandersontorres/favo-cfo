@@ -9,7 +9,11 @@ Author: design session 2026-05-24.
 - ✅ **Phase A** — Supabase Auth login gate (commit cc59cd9). Verified: anon sees
   0 rows, authenticated tenant member sees all data. Anderson logged in OK.
 - ⬜ **Phase B** — multi-tenant polish (switcher, dynamic tenant name, role-aware UI)
-- ⬜ **Phase C** — endpoint hardening (forward token + membership check on /api/*)
+- 🟡 **Phase C** — endpoint hardening. **Sync endpoints DONE (2026-07-28)**:
+  `sync-square-sales/tips/labor/payouts` + `plaid-sync` now go through
+  `api/_auth.js`. Still open: `parse-statement`, `parse-paystub`,
+  `parse-aggregator-statement`, `forecast-bookings`, `sync-marketing`,
+  `plaid-link-token`, `plaid-exchange`, `unit-*`, `anthropic`.
 
 ---
 
@@ -122,6 +126,38 @@ tenant_id could hit them. Harden by:
    requested tenant (`r7_user_tenants`) before doing work.
 
 This is a follow-up, not a blocker for the read-path fix.
+
+#### Implemented for the sync endpoints (2026-07-28)
+
+`api/_auth.js` holds the shared gate. `authorizeSync(req, res, tenantId, db)`
+accepts two credentials on the same `Authorization: Bearer` header:
+
+| Caller | Credential | Scope |
+|---|---|---|
+| Browser (Sync Sales / Sync Bank buttons) | Supabase access token, forwarded by `authHeaders()` in `src/lib/supabase.js` | tenants the user is in, per `r7_user_tenants` |
+| `api/cron-sync-square.js` | `CRON_SECRET` (timing-safe compare) | any tenant |
+
+Why a shared secret for cron rather than a service account: the project runs
+Vercel Authentication with `ssoProtection.deploymentType =
+"all_except_custom_domains"`, so cron must call the endpoints through
+`cfo.clariva.cloud`. It has no user session to forward, so a header it sets
+itself is the only credential available on that path.
+
+The check runs **before** the `tenant_id` presence check, so an unauthenticated
+probe gets 401 rather than the 400 that used to prove the handler was running.
+`CRON_SECRET` is now required, not optional — `cron-sync-square.js` returns 500
+when it's unset instead of firing four calls that would all 401.
+
+**Applying this to the remaining endpoints** is a two-line change each:
+
+```js
+const auth = await authorizeSync(req, res, tenant_id, supabase);
+if (!auth.ok) return;
+```
+
+plus swapping the client's `fetch` headers to `await authHeaders()`. Note that
+`parse-*` and `anthropic` are the higher-cost targets (they bill Anthropic
+tokens per call), so they're the natural next batch.
 
 ---
 
