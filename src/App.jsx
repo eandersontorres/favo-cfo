@@ -2194,7 +2194,7 @@ function KitchenInvoicePanel({ txn, allTransactions, categories, tenantId, setTr
                     <td className="mono text-right" style={{ padding: "3px 6px", color: "var(--text3)", whiteSpace: "nowrap" }}>{line.qty}{line.unit ? ` ${line.unit}` : ""}</td>
                     <td className="mono text-right" style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>{fmt(line.landed)}</td>
                     <td style={{ padding: "3px 6px", color: line.kitchenCatName ? "var(--text2)" : "var(--text3)", whiteSpace: "nowrap" }}>
-                      {line.kitchenCatName || (line.mappedItemId ? "mapped item, no category" : "no matching item in Kitchen")}
+                      {line.isCharge ? "invoice charge" : (line.kitchenCatName || (line.mappedItemId ? "mapped item, no category" : "no matching item in Kitchen"))}
                       {line.kitchenCatName && line.kitchenVia && line.kitchenVia !== "invoice" && (
                         <span className="tag" style={{ marginLeft: 6, fontSize: 9, color: "var(--text3)", background: "var(--surface3)", border: "1px solid var(--border)" }}
                           title={line.kitchenVia === "code"
@@ -2209,7 +2209,7 @@ function KitchenInvoicePanel({ txn, allTransactions, categories, tenantId, setTr
                         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                           <span style={{ color: "var(--text)" }}>{catName(line.accountId) || "—"}</span>
                           <span className="tag" style={{ fontSize: 9, color: "var(--text3)", background: "var(--surface3)", border: "1px solid var(--border)" }}
-                            title={line.resolvedBy === "rule" ? "Set here, in the invoice panel" : "From the Kitchen category map"}>
+                            title={line.resolvedBy === "rule" ? (line.isCharge ? "Invoice charge booked by a charge rule, not spread over the lines" : "Rule set for this item") : "From the Kitchen category map"}>
                             {line.resolvedBy === "rule" ? "rule" : "Kitchen map"}
                           </span>
                         </span>
