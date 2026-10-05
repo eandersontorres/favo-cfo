@@ -513,6 +513,19 @@ export function normalizeVendorKey(name) {
 }
 const ruleKey = (vendorKey, itemKey) => `${vendorKey || ''}|${itemKey}`
 
+// Rules keyed by something other than an item name, kept in the same table
+// (item_key is free text):
+//   ITEM:<kitchen item id> -- every line Kitchen resolves to that item, whatever
+//     the vendor prints. Needed when the item shares a Kitchen category with
+//     things that belong elsewhere: "Keg Deposit" sits in the same category as
+//     napkins and to-go boxes, so mapping the category would move them all.
+//   CHARGE:<KIND> -- an invoice-level charge of that kind (r7_purchases.charges)
+//     is booked to the rule's account instead of being spread over the lines.
+//     Kitchen allocates every charge into _landedUnitCost; a keg deposit read as
+//     "Total Deposit $150" turned $98 of beer into $148 of beer.
+export const ITEM_RULE_PREFIX = 'ITEM:'
+export const CHARGE_RULE_PREFIX = 'CHARGE:'
+
 export async function fetchItemRules(tenantId) {
   const tid = tenantId || TENANT()
   if (tid === 'demo') return []
@@ -643,11 +656,38 @@ export function resolveLineAccount(line, vendorName, ctx) {
   }
   const hit = findKitchenItem(line, ctx)
   const kcat = hit ? (ctx.catByItem.get(hit.itemId) ?? null) : null
+  const byItem = hit ? ctx.rules.get(ruleKey('', ITEM_RULE_PREFIX + hit.itemId)) : null
+  if (byItem) return { accountId: byItem, kitchenCatId: kcat, resolvedBy: 'rule', kitchenVia: hit.via, kitchenItemId: hit.itemId }
   if (kcat) {
     const acct = ctx.acctByCat.get(kcat) || null
     return { accountId: acct, kitchenCatId: kcat, resolvedBy: acct ? 'kitchen' : null, kitchenVia: hit.via, kitchenItemId: hit.itemId }
   }
   return { accountId: null, kitchenCatId: null, resolvedBy: null, kitchenVia: hit ? hit.via : null, kitchenItemId: hit ? hit.itemId : null }
+}
+
+// Invoice charges that a CHARGE:<KIND> rule sends to their own account.
+// Returns, per line, how much of its _chargeAlloc to take back out of its
+// landed value, and the charges as extra lines carrying the rule's account.
+// When Kitchen did not spread the charges (no _chargeAlloc), nothing comes out
+// of the lines; the charge lines still stand on their own and the proration
+// to the invoice total does the rest.
+export function carveRuledCharges(items, charges, rules) {
+  const deductions = (items || []).map(() => 0)
+  const chargeLines = []
+  for (const c of parseItems(charges)) {
+    const amount = parseFloat(c?.amount) || 0
+    const kind = String(c?.kind || '').trim().toUpperCase()
+    const accountId = kind ? rules.get(ruleKey('', CHARGE_RULE_PREFIX + kind)) : null
+    if (!amount || !accountId) continue
+    chargeLines.push({ kind, label: String(c?.label || kind).trim(), amount, accountId })
+  }
+  const carved = chargeLines.reduce((s, c) => s + c.amount, 0)
+  const spread = (items || []).reduce((s, it) => s + (parseFloat(it?._chargeAlloc) || 0), 0)
+  if (carved > 0 && spread > 0) {
+    const ratio = Math.min(1, carved / spread)
+    ;(items || []).forEach((it, i) => { deductions[i] = (parseFloat(it?._chargeAlloc) || 0) * ratio })
+  }
+  return { deductions, chargeLines }
 }
 
 // Sum lines into { categoryId, amount } buckets, descending.
@@ -683,9 +723,14 @@ export async function fetchPurchaseAllocations(purchases, tenantId) {
   const ctx = await loadResolutionContext(purchases, tid)
   if (ctx.itemsByPurchase.size === 0) return out
 
-  const vendorById = new Map(purchases.map(p => [String(p.id), p.supplier || '']))
+  const byId = new Map(purchases.map(p => [String(p.id), p]))
   for (const [pid, items] of ctx.itemsByPurchase) {
-    const lines = items.map(it => ({ landed: lineValue(it), ...resolveLineAccount(it, vendorById.get(pid), ctx) }))
+    const pur = byId.get(pid) || {}
+    const { deductions, chargeLines } = carveRuledCharges(items, pur.charges, ctx.rules)
+    const lines = [
+      ...items.map((it, i) => ({ landed: lineValue(it) - deductions[i], ...resolveLineAccount(it, pur.supplier || '', ctx) })),
+      ...chargeLines.map(c => ({ landed: c.amount, accountId: c.accountId })),
+    ]
     const list = bucketsFromLines(lines)
     if (list.length > 0) out.set(pid, list)
   }
@@ -703,7 +748,7 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
   if (!purchaseId || tid === 'demo') return null
 
   const { data: pur, error: pErr } = await supabase
-    .from('r7_purchases').select('id, date, supplier, total, items, invoice_path').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
+    .from('r7_purchases').select('id, date, supplier, total, items, charges, invoice_path').eq('id', purchaseId).eq('tenant_id', tid).maybeSingle()
   if (pErr || !pur) { if (pErr) console.error('fetchPurchaseLines/purchase', pErr); return null }
 
   const ctx = await loadResolutionContext([pur], tid)
@@ -719,6 +764,7 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
     for (const c of (cats || [])) catNames.set(String(c.id), String(c.name || '').trim())
   }
 
+  const { deductions, chargeLines } = carveRuledCharges(items, pur.charges, ctx.rules)
   const lines = items.map((it, idx) => {
     const r = resolved[idx]
     const kcat = r.kitchenCatId
@@ -727,7 +773,7 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
       name: String(it?.name || '').trim() || '(unnamed line)',
       qty: parseFloat(it?.qty) || 0,
       unit: it?.unit || '',
-      landed: lineValue(it),
+      landed: lineValue(it) - deductions[idx],
       productCode: it?.productCode ? String(it.productCode) : null,
       mappedItemId: r.kitchenItemId || null,
       // 'invoice' = Kitchen linked the line; 'code' / 'name' = the CFO found
@@ -739,6 +785,15 @@ export async function fetchPurchaseLines(purchaseId, tenantId) {
       resolvedBy: r.resolvedBy,
     }
   })
+  // Charges a CHARGE:<KIND> rule took out of the lines, shown as their own
+  // lines so the panel's total still matches the invoice.
+  chargeLines.forEach((c, k) => lines.push({
+    idx: items.length + k,
+    name: `${c.label} (invoice charge)`,
+    qty: 1, unit: '', landed: c.amount, productCode: null, mappedItemId: null,
+    kitchenVia: null, kitchenCatId: null, kitchenCatName: null,
+    accountId: c.accountId, resolvedBy: 'rule', isCharge: true,
+  }))
 
   return {
     purchase: { id: String(pur.id), date: pur.date, supplier: pur.supplier || '', total: parseFloat(pur.total) || 0, invoice_path: pur.invoice_path || null },
