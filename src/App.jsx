@@ -8358,6 +8358,16 @@ function payrollRunAnchorDate(run) {
 function payrollRunShadowDate(run) {
   return run?.period_end || run?.totals?.check_date || run?.pay_date || null;
 }
+// A run whose period ends inside the closed books belongs to a month that was
+// closed on a cash basis: its bank legs ARE that month's labor. Booking the
+// paystub there and settling the legs rewrites a closed month -- on 02/10/2026
+// the pass did exactly that to May (three half-months) and June (one), because
+// the lock had been left open. The DB trigger only blocks inserts, so it would
+// have stopped the shadows and still let the legs be re-tagged. The pass and
+// the manual re-run skip these runs entirely.
+function runInClosedBooks(run) {
+  return !!run?.period_end && String(run.period_end).slice(0, 10) <= BOOKS_CLOSED_THROUGH;
+}
 function runHasPaystub(run) {
   return (parseFloat(run?.totals?.total_bank_debit) || 0) > 0;
 }
@@ -8392,7 +8402,7 @@ function payrollBankWindowsToFetch(runs, loaded) {
   const covered = w => !!(loaded?.start && loaded?.end && w.start >= loaded.start && w.end <= loaded.end);
   const nextDay = iso => { const d = new Date(iso + "T12:00:00"); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10); };
   const wins = (runs || [])
-    .filter(r => r.status !== "cancelled")
+    .filter(r => r.status !== "cancelled" && !runInClosedBooks(r))
     .map(payrollRunBankWindow)
     .filter(w => w && !covered(w))
     .sort((a, b) => a.start.localeCompare(b.start));
@@ -8655,6 +8665,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
   const settlePaystubRun = async (run) => {
     const t = run?.totals || {};
     if (!runHasPaystub(run)) return { ok: false, reason: "no_paystub" };
+    if (runInClosedBooks(run)) return { ok: false, reason: "closed_books" };
     const plan = matchPayrollRunsToBank(runs, transactions, settleCtx).get(run.id);
     if (!plan) return { ok: false, reason: "no_plan" };
 
@@ -8924,7 +8935,7 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     if (windowsPending) return;
     const today = new Date().toISOString().slice(0, 10);
     const plans = matchPayrollRunsToBank(runs, transactions, settleCtx);
-    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r));
+    const due = runs.filter(r => r.status !== "cancelled" && runHasPaystub(r) && !runInClosedBooks(r));
     for (const r of due) {
       const plan = plans.get(r.id);
       if (!plan) continue;
@@ -8944,6 +8955,10 @@ function Payroll({ runs, shifts, tipsDaily, transactions, categories, setTransac
     if (!selected) return;
     if (!runHasPaystub(selected)) {
       showToast("This run has no paystub data — import a paystub PDF first", "error");
+      return;
+    }
+    if (runInClosedBooks(selected)) {
+      showToast(`Books are closed through ${BOOKS_CLOSED_THROUGH} — that month was closed on a cash basis, its bank legs already are its labor`, "info");
       return;
     }
     if (windowsPending) { showToast("Still loading this run's bank window — try again in a moment", "info"); return; }
